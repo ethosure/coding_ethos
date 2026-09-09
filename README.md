@@ -2,7 +2,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/ethosure/coding_ethos/main/docs/logo-banner.svg" alt="Coding Ethos Logo" width="600">
+  <img src="docs/logo-banner.svg" alt="Coding Ethos Logo" width="600">
 </p>
 
 # Coding Ethos
@@ -18,7 +18,7 @@
 [![Release Trust](https://github.com/ethosure/coding_ethos/actions/workflows/release.yml/badge.svg)](https://github.com/ethosure/coding_ethos/actions/workflows/release.yml)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/ethosure/coding_ethos/badge)](https://scorecard.dev/viewer/?uri=github.com/ethosure/coding_ethos)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/12737/badge)](https://www.bestpractices.dev/en/projects/12737)
-[![Docs](https://img.shields.io/website?url=https%3A%2F%2Fpaudley.github.io%2Fcoding-ethos%2F&label=docs)](https://paudley.github.io/coding-ethos/)
+[![Docs](https://img.shields.io/badge/docs-index-blue)](docs/index.md)
 [![Attestations](https://img.shields.io/badge/attestations-GitHub%20%2B%20PyPI-blue)](docs/SUPPLY_CHAIN_ATTESTATIONS.md)
 [![SBOM](https://img.shields.io/badge/SBOM-SPDX%20JSON-blue)](docs/SUPPLY_CHAIN_ATTESTATIONS.md)
 [![Security Policy](https://img.shields.io/badge/security-policy-blue)](SECURITY.md)
@@ -95,7 +95,7 @@ Start the local MCP server for configured agents:
 bin/coding-ethos-run mcp
 ```
 
-![coding-ethos MCP and SARIF demo](https://raw.githubusercontent.com/ethosure/coding_ethos/main/docs/assets/coding-ethos-demo.gif)
+![coding-ethos MCP and SARIF demo](docs/assets/coding-ethos-demo.gif)
 
 The project is built around defense in depth for AI-assisted coding:
 

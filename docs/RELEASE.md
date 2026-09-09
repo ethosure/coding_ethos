@@ -132,8 +132,8 @@ PyPI upload uses OIDC Trusted Publishing through
 `pypa/gh-action-pypi-publish`, and enables PyPI digital attestations. Configure
 the corresponding Trusted Publisher in PyPI before cutting a release:
 
-- owner: `paudley`
-- repository: `coding-ethos`
+- owner: `ethosure`
+- repository: `coding_ethos`
 - workflow: `release.yml`
 - environment: `pypi`
 

@@ -146,8 +146,8 @@ the generated attestations before publishing the first release.
 Then configure a PyPI Trusted Publisher:
 
 - PyPI project: `coding-ethos`
-- GitHub owner: `paudley`
-- GitHub repository: `coding-ethos`
+- GitHub owner: `ethosure`
+- GitHub repository: `coding_ethos`
 - Workflow filename: `release.yml`
 - Environment: `pypi`
 

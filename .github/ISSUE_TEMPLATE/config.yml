@@ -4,7 +4,7 @@
 blank_issues_enabled: false
 contact_links:
   - name: Documentation
-    url: https://paudley.github.io/coding-ethos/
+    url: https://github.com/ethosure/coding_ethos/blob/main/docs/index.md
     about: Read install, usage, policy, MCP, CI, and release documentation.
   - name: Security policy
     url: https://github.com/ethosure/coding_ethos/blob/main/SECURITY.md
