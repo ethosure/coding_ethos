@@ -1,0 +1,71 @@
+// SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package evidence
+
+import "context"
+
+type CodeFact struct {
+	ID            string     `json:"id"`
+	RepoID        string     `json:"repo_id,omitempty"`
+	NodeKind      string     `json:"node_kind,omitempty"`
+	Signature     string     `json:"signature,omitempty"`
+	SearchText    string     `json:"search_text,omitempty"`
+	SourceSpan    SourceSpan `json:"source_span"`
+	SchemaVersion int        `json:"schema_version"`
+}
+
+type VectorRecord struct {
+	Metadata      map[string]string `json:"metadata,omitempty"`
+	ID            string            `json:"id"`
+	Collection    string            `json:"collection"`
+	ModelID       string            `json:"model_id"`
+	InputKind     string            `json:"input_kind,omitempty"`
+	Text          string            `json:"text,omitempty"`
+	Vector        []float32         `json:"vector,omitempty"`
+	Dimension     int               `json:"dimension"`
+	SchemaVersion int               `json:"schema_version"`
+}
+
+type VectorQuery struct {
+	Filters    map[string]string `json:"filters,omitempty"`
+	Collection string            `json:"collection"`
+	ModelID    string            `json:"model_id"`
+	Vector     []float32         `json:"vector"`
+	Limit      int               `json:"limit"`
+}
+
+type VectorMatch struct {
+	Metadata map[string]string `json:"metadata,omitempty"`
+	ID       string            `json:"id"`
+	Score    float64           `json:"score"`
+}
+
+type VectorStats struct {
+	Collections map[string]int `json:"collections,omitempty"`
+	Backend     string         `json:"backend"`
+	Rows        int            `json:"rows"`
+}
+
+type FindingStore interface {
+	UpsertFinding(ctx context.Context, finding Finding) error
+	FindFinding(ctx context.Context, id string) (Finding, bool, error)
+}
+
+type CodeFactStore interface {
+	UpsertCodeFact(ctx context.Context, fact CodeFact) error
+	FindCodeFact(ctx context.Context, id string) (CodeFact, bool, error)
+}
+
+type VectorIndex interface {
+	UpsertEmbedding(ctx context.Context, record VectorRecord) error
+	DeleteEmbedding(ctx context.Context, collection, id string) error
+	Search(ctx context.Context, query VectorQuery) ([]VectorMatch, error)
+	Stats(ctx context.Context) (VectorStats, error)
+	Rebuild(ctx context.Context, collection string) error
+}
+
+type TraceIngestor interface {
+	IngestHookTrace(ctx context.Context, payload []byte) error
+	IngestLintTrace(ctx context.Context, payload []byte) error
+}

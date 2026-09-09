@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+version: 2
+updates:
+  # Repository branch protection requires signed commits. Dependabot cannot
+  # satisfy that policy for version-update pull requests, so dependency
+  # updates are tracked externally and applied through locally signed commits.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "python"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 0
+
+  - package-ecosystem: "uv"
+    directory: "/pre-commit/hooks"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "python"
+      - "pre-commit"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 0
+
+  - package-ecosystem: "gomod"
+    directory: "/go"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "go"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 0
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 0

@@ -1,0 +1,99 @@
+# SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "coding-ethos"
+version = "0.3.0"
+description = "Policy-as-code enforcement for AI agents with MCP, CEL, Git hooks, SARIF, and static-analysis guardrails."
+readme = "README.md"
+license = "AGPL-3.0-only"
+authors = [
+    { name = "Ethosure Governance Inc.", email = "oss@ethosure.com" },
+]
+maintainers = [
+    { name = "Ethosure Governance Inc.", email = "oss@ethosure.com" },
+]
+keywords = [
+    "ai",
+    "ai-agents",
+    "agent-instructions",
+    "cel",
+    "codex",
+    "devsecops",
+    "gemini",
+    "git-hooks",
+    "claude",
+    "llm",
+    "mcp",
+    "mcp-server",
+    "policy-as-code",
+    "prompt-engineering",
+    "sarif",
+    "static-analysis",
+    "yaml",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+    "Topic :: Software Development :: Documentation",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Security",
+    "Topic :: Text Processing :: Markup",
+]
+requires-python = ">=3.13"
+dependencies = [
+    "Jinja2>=3.1.6",
+    "PyYAML>=6.0.2",
+    "ruamel.yaml>=0.18.16",
+]
+
+[project.urls]
+Homepage = "https://github.com/ethosure/coding_ethos"
+Repository = "https://github.com/ethosure/coding_ethos"
+Issues = "https://github.com/ethosure/coding_ethos/issues"
+Changelog = "https://github.com/ethosure/coding_ethos/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/ethosure/coding_ethos/blob/main/docs/index.md"
+Security = "https://github.com/ethosure/coding_ethos/blob/main/SECURITY.md"
+
+[project.scripts]
+coding-ethos = "coding_ethos.cli:main"
+
+[dependency-groups]
+dev = [
+    "coverage>=7.13.0",
+    "pytest>=8.0",
+    "types-pyyaml>=6.0.12.20260508",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["coding_ethos"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"coding_ethos.yml" = "coding_ethos/resources/coding_ethos.yml"
+"config.yaml" = "coding_ethos/resources/config.yaml"
+"config.toml" = "coding_ethos/resources/config.toml"
+"repo_config.example.yaml" = "coding_ethos/resources/repo_config.example.yaml"
+"repo_config.example.toml" = "coding_ethos/resources/repo_config.example.toml"
+"repo_ethos.example.yml" = "coding_ethos/resources/repo_ethos.example.yml"
+
+[tool.uv]
+exclude-newer = "7 days"
+exclude-newer-package = { pip = "2026-07-29T21:57:56Z", sqlfluff = "2026-05-15T00:00:00Z" }
+managed = true
+
+[tool.uv.workspace]
+members = ["pre-commit/hooks"]
+
+[tool.pytest]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = ["-ra"]

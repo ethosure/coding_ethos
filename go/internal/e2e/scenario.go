@@ -1,0 +1,893 @@
+// SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package e2e
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/ethosure/coding_ethos/go/internal/apperror"
+	"github.com/ethosure/coding_ethos/go/internal/safeexec"
+)
+
+const (
+	commandTimeout           = 30 * time.Second
+	commandWaitDelay         = time.Second
+	e2eDirMode               = 0o700
+	e2eFileMode              = 0o600
+	optionalVenvRuntimeEntry = ".venv"
+)
+
+type instrumentedRuntimeCache struct {
+	roots map[string]string
+	mutex sync.Mutex
+}
+
+// instrumentedRuntimeRoots caches the expensive coverage runtime for the whole
+// package run; individual t.TempDir lifetimes are too short for parallel reuse.
+var instrumentedRuntimeRoots = instrumentedRuntimeCache{ //nolint:gochecknoglobals
+	roots: map[string]string{},
+}
+
+// Repo is an isolated checkout copied from a checked-in reference repository.
+type Repo struct {
+	Root      string
+	EthosRoot string
+}
+
+// CommandResult captures the observable result of a real command execution.
+type CommandResult struct {
+	Cwd      string
+	Stdout   string
+	Stderr   string
+	Combined string
+	Args     []string
+	Code     int
+}
+
+// FromReference copies a checked-in reference repository into a temporary
+// directory and initializes it as a real Git repository.
+func FromReference(t *testing.T, ethosRoot, reference string) Repo {
+	t.Helper()
+
+	source := filepath.Join(ethosRoot, "examples", "reference-repos", reference)
+
+	info, inlineErrAutoA := os.Stat(source)
+	if inlineErrAutoA != nil || !info.IsDir() {
+		t.Fatalf("reference repo %q is unavailable: %v", reference, inlineErrAutoA)
+	}
+
+	root := filepath.Join(t.TempDir(), reference)
+
+	err := copyTree(root, source)
+	if err != nil {
+		t.Fatalf("copy reference repo: %v", err)
+	}
+
+	repo := Repo{Root: root, EthosRoot: ethosRoot}
+	repo.Git(t, "init")
+	repo.Git(t, "config", "user.email", "e2e@example.com")
+	repo.Git(t, "config", "user.name", "E2E Test")
+	repo.Git(t, "config", "commit.gpgsign", "false")
+	repo.Git(t, "add", ".")
+	repo.Git(t, "commit", "-m", "test(repo): initialize reference repo")
+
+	return repo
+}
+
+// RequireRuntime skips e2e scenarios unless the caller opted into real
+// workflow execution. These tests run real managed tools and repository
+// commands, so broad unit-test sweeps should invoke them through make targets
+// that first prepare the runtime.
+func RequireRuntime(t *testing.T, ethosRoot string) {
+	t.Helper()
+
+	if testing.Short() {
+		t.Skip("real workflow e2e tests are skipped in -short mode")
+	}
+
+	required := []string{
+		filepath.Join(ethosRoot, "bin", "coding-ethos-run"),
+		filepath.Join(ethosRoot, "bin", "coding-ethos-lint"),
+		filepath.Join(ethosRoot, "bin", "coding-ethos-sandbox"),
+		filepath.Join(ethosRoot, "bin", "coding-ethos-policy"),
+		filepath.Join(ethosRoot, "bin", "coding-ethos-mcp"),
+		filepath.Join(ethosRoot, "bin", "coding-ethos-hook-log"),
+		filepath.Join(ethosRoot, "bin", "coding-ethos-hook-runner"),
+		filepath.Join(ethosRoot, "bin", "coding-ethos-toolchain"),
+		filepath.Join(ethosRoot, "build", "policy", "policy-bundle.json"),
+	}
+	for _, path := range required {
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() {
+			t.Skipf("runtime artifact missing; run make build first: %s", path)
+		}
+	}
+}
+
+// InstrumentedEthosRoot returns a temporary runtime root with coverage-enabled
+// coding-ethos binaries when GOCOVERDIR is active. This lets real subprocess
+// e2e scenarios contribute Go coverage without replacing the managed tools they
+// execute.
+func InstrumentedEthosRoot(t *testing.T, ethosRoot string) string {
+	t.Helper()
+
+	coverDir := strings.TrimSpace(os.Getenv("GOCOVERDIR"))
+	if coverDir == "" {
+		return ethosRoot
+	}
+
+	absoluteCoverageDir(t, coverDir)
+
+	if runtime.GOOS == "windows" {
+		t.Skip("instrumented e2e runtime uses POSIX symlinks")
+	}
+
+	return cachedInstrumentedEthosRoot(t, ethosRoot)
+}
+
+// MutableBinEthosRoot returns an isolated runtime root whose bin directory can
+// receive command shims without mutating the repository checkout.
+func MutableBinEthosRoot(t *testing.T, ethosRoot string) string {
+	t.Helper()
+
+	sourceRoot := InstrumentedEthosRoot(t, ethosRoot)
+	runtimeRoot := filepath.Join(t.TempDir(), "coding-ethos-runtime")
+
+	copyMutableRuntimeBin(t, sourceRoot, runtimeRoot)
+
+	for _, entry := range []string{
+		"build",
+		"config.yaml",
+		"coding_ethos.yml",
+		optionalVenvRuntimeEntry,
+		"go",
+		"pre-commit",
+		"repo_ethos.yml",
+	} {
+		source := filepath.Join(sourceRoot, entry)
+
+		_, statErr := os.Stat(source)
+		if statErr != nil {
+			if entry == optionalVenvRuntimeEntry && errors.Is(statErr, os.ErrNotExist) {
+				continue
+			}
+
+			t.Fatalf("mutable runtime source %s unavailable: %v", entry, statErr)
+		}
+
+		err := copyOrSymlinkInstrumentedRuntimeEntry(
+			source,
+			filepath.Join(runtimeRoot, entry),
+		)
+		if err != nil {
+			t.Fatalf("copy %s into mutable runtime: %v", entry, err)
+		}
+	}
+
+	return runtimeRoot
+}
+
+func copyMutableRuntimeBin(t *testing.T, sourceRoot, runtimeRoot string) {
+	t.Helper()
+
+	binRoot := filepath.Join(runtimeRoot, "bin")
+
+	err := os.MkdirAll(binRoot, e2eDirMode)
+	if err != nil {
+		t.Fatalf("create mutable runtime bin: %v", err)
+	}
+
+	binaries, err := filepath.Glob(filepath.Join(sourceRoot, "bin", "*"))
+	if err != nil {
+		t.Fatalf("list mutable runtime binaries: %v", err)
+	}
+
+	for _, source := range binaries {
+		info, statErr := os.Stat(source)
+		if statErr != nil {
+			t.Fatalf("stat mutable runtime binary %s: %v", source, statErr)
+		}
+
+		if !info.Mode().IsRegular() {
+			continue
+		}
+
+		target := filepath.Join(binRoot, filepath.Base(source))
+		if filepath.Base(source) == "coding-ethos-sandbox" {
+			LinkManagedSandboxHelper(t, source, target)
+
+			continue
+		}
+
+		payload, readErr := os.ReadFile(source)
+		if readErr != nil {
+			t.Fatalf("read mutable runtime binary %s: %v", source, readErr)
+		}
+
+		writeErr := writeInstrumentedRuntimeFile(target, payload, info.Mode().Perm())
+		if writeErr != nil {
+			t.Fatalf("write mutable runtime binary %s: %v", target, writeErr)
+		}
+	}
+}
+
+func cachedInstrumentedEthosRoot(t *testing.T, ethosRoot string) string {
+	t.Helper()
+
+	instrumentedRuntimeRoots.mutex.Lock()
+	defer instrumentedRuntimeRoots.mutex.Unlock()
+
+	if runtimeRoot, found := instrumentedRuntimeRoots.roots[ethosRoot]; found {
+		return runtimeRoot
+	}
+
+	runtimeRoot := buildInstrumentedEthosRoot(t, ethosRoot)
+	instrumentedRuntimeRoots.roots[ethosRoot] = runtimeRoot
+
+	return runtimeRoot
+}
+
+func buildInstrumentedEthosRoot(t *testing.T, ethosRoot string) string {
+	t.Helper()
+
+	runtimeRoot, err := os.MkdirTemp("", "coding-ethos-runtime-") //nolint:usetesting
+	if err != nil {
+		t.Fatalf("create instrumented runtime root: %v", err)
+	}
+
+	err = os.MkdirAll(filepath.Join(runtimeRoot, "bin"), e2eDirMode)
+	if err != nil {
+		t.Fatalf("create instrumented runtime bin: %v", err)
+	}
+
+	for _, entry := range []string{
+		"build",
+		"config.yaml",
+		"coding_ethos.yml",
+		optionalVenvRuntimeEntry,
+		"go",
+		"repo_ethos.yml",
+	} {
+		source := filepath.Join(ethosRoot, entry)
+
+		_, statErr := os.Stat(source)
+		if statErr != nil {
+			if entry == optionalVenvRuntimeEntry && errors.Is(statErr, os.ErrNotExist) {
+				continue
+			}
+
+			t.Fatalf("instrumented runtime source %s unavailable: %v", entry, statErr)
+		}
+
+		err = copyOrSymlinkInstrumentedRuntimeEntry(
+			source,
+			filepath.Join(runtimeRoot, entry),
+		)
+		if err != nil {
+			t.Fatalf("copy %s into instrumented runtime: %v", entry, err)
+		}
+	}
+
+	err = copyRuntimePreCommit(runtimeRoot, ethosRoot)
+	if err != nil {
+		t.Fatalf("copy pre-commit runtime tree: %v", err)
+	}
+
+	for _, command := range []string{
+		"coding-ethos-run",
+		"coding-ethos-lint",
+		"coding-ethos-policy",
+		"coding-ethos-hook-log",
+		"coding-ethos-hook-runner",
+		"coding-ethos-toolchain",
+	} {
+		buildInstrumentedCommand(t, ethosRoot, runtimeRoot, command)
+	}
+
+	LinkManagedSandboxHelper(
+		t,
+		filepath.Join(ethosRoot, "bin", "coding-ethos-sandbox"),
+		filepath.Join(runtimeRoot, "bin", "coding-ethos-sandbox"),
+	)
+
+	return runtimeRoot
+}
+
+// LinkManagedSandboxHelper preserves the exact repository-managed executable
+// path that host AppArmor policy authorizes for Linux namespace creation.
+// Instrumenting or copying the helper changes that path and makes an otherwise
+// valid nested sandbox fail closed before it can apply its policy.
+func LinkManagedSandboxHelper(t *testing.T, source, destination string) {
+	t.Helper()
+
+	resolved, err := filepath.EvalSymlinks(source)
+	if err != nil {
+		t.Fatalf("resolve managed sandbox helper %s: %v", source, err)
+	}
+
+	err = os.Symlink(resolved, destination)
+	if err != nil {
+		t.Fatalf("link managed sandbox helper %s: %v", destination, err)
+	}
+}
+
+func copyOrSymlinkInstrumentedRuntimeEntry(source, destination string) error {
+	info, err := os.Stat(source)
+	if err != nil {
+		return fmt.Errorf("stat runtime entry %s: %w", source, err)
+	}
+
+	if info.Mode().IsRegular() {
+		payload, readErr := os.ReadFile(source)
+		if readErr != nil {
+			return fmt.Errorf("read runtime entry %s: %w", source, readErr)
+		}
+
+		err = writeInstrumentedRuntimeFile(destination, payload, info.Mode().Perm())
+		if err != nil {
+			return fmt.Errorf("write runtime entry %s: %w", destination, err)
+		}
+
+		return nil
+	}
+
+	err = os.Symlink(source, destination)
+	if err != nil {
+		return fmt.Errorf("symlink runtime entry %s: %w", destination, err)
+	}
+
+	return nil
+}
+
+func writeInstrumentedRuntimeFile(
+	destination string,
+	payload []byte,
+	perm fs.FileMode,
+) error {
+	root, err := os.OpenRoot(filepath.Dir(destination))
+	if err != nil {
+		return fmt.Errorf("open runtime root: %w", err)
+	}
+	defer root.Close()
+
+	err = root.WriteFile(filepath.Base(destination), payload, perm)
+	if err != nil {
+		return fmt.Errorf("write runtime file: %w", err)
+	}
+
+	return nil
+}
+
+func absoluteCoverageDir(t *testing.T, coverDir string) string {
+	t.Helper()
+
+	if filepath.IsAbs(coverDir) {
+		return coverDir
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("resolve working directory for GOCOVERDIR: %v", err)
+	}
+
+	absolute := filepath.Clean(filepath.Join(cwd, coverDir))
+
+	err = os.MkdirAll(absolute, e2eDirMode)
+	if err != nil {
+		t.Fatalf("create GOCOVERDIR: %v", err)
+	}
+
+	return absolute
+}
+
+func commandEnvironmentWith(t *testing.T, overrides map[string]string) []string {
+	t.Helper()
+
+	env := withoutInheritedRuntimeContext(os.Environ())
+	for index, entry := range env {
+		value, ok := strings.CutPrefix(entry, "GOCOVERDIR=")
+		if ok && strings.TrimSpace(value) != "" {
+			env[index] = "GOCOVERDIR=" + absoluteCoverageDir(t, value)
+		}
+	}
+
+	for key, value := range overrides {
+		env = appendWithoutEnvName(env, key)
+		env = append(env, key+"="+value)
+	}
+
+	return env
+}
+
+// CommandEnvironment returns a fixture-safe subprocess environment with
+// inherited Coding Ethos runtime ownership removed before applying overrides.
+func CommandEnvironment(t *testing.T, overrides map[string]string) []string {
+	t.Helper()
+
+	return commandEnvironmentWith(t, overrides)
+}
+
+func withoutInheritedRuntimeContext(env []string) []string {
+	for _, name := range []string{
+		"CODE_ETHOS_CONSUMER_ROOT",
+		"CODE_ETHOS_GIT_WRAPPER_AUTHORIZED",
+		"CODE_ETHOS_GIT_WRAPPER_PID",
+		"CODE_ETHOS_HOOK_LOGGING_ACTIVE",
+		"CODE_ETHOS_HOOK_RUN_DIR",
+		"CODE_ETHOS_LOCAL_ROOT",
+		"CODE_ETHOS_PRECOMMIT_CONFIG",
+		"CODE_ETHOS_PRECOMMIT_ROOT",
+		"CODE_ETHOS_STATE_ROOT",
+		"CODING_ETHOS_EXEC_STACK",
+		"CODING_ETHOS_GIT_SHIM_DIR",
+		"CODING_ETHOS_RUN_GO_HOOK",
+		"INVOCATION_CWD",
+		"MANAGED_TOOLCHAIN_MANIFEST",
+		"POLICY_METADATA",
+		"TOOLS_SRC_DIR",
+	} {
+		env = appendWithoutEnvName(env, name)
+	}
+
+	return env
+}
+
+func appendWithoutEnvName(env []string, name string) []string {
+	prefix := name + "="
+	out := env[:0]
+
+	for _, entry := range env {
+		if !strings.HasPrefix(entry, prefix) {
+			out = append(out, entry)
+		}
+	}
+
+	return out
+}
+
+// Run executes a real command in the reference repository.
+func (repo Repo) Run(t *testing.T, args ...string) CommandResult {
+	t.Helper()
+
+	return Run(t, repo.Root, args...)
+}
+
+// RunWithInput executes a real command in the reference repository with stdin.
+func (repo Repo) RunWithInput(
+	t *testing.T,
+	input string,
+	args ...string,
+) CommandResult {
+	t.Helper()
+
+	return RunWithInput(t, repo.Root, input, args...)
+}
+
+// Git executes /usr/bin/git in the reference repository.
+func (repo Repo) Git(t *testing.T, args ...string) CommandResult {
+	t.Helper()
+
+	return repo.Run(t, append([]string{"/usr/bin/git"}, args...)...)
+}
+
+// CodingEthosRun executes the built coding-ethos dispatcher against this repo.
+func (repo Repo) CodingEthosRun(t *testing.T, args ...string) CommandResult {
+	t.Helper()
+
+	binary := filepath.Join(repo.EthosRoot, "bin", "coding-ethos-run")
+	command := append([]string{binary}, args...)
+	result := repo.Run(t, command...)
+
+	return result
+}
+
+// CodingEthosRunWithEnv executes the dispatcher with per-command environment
+// overrides.
+func (repo Repo) CodingEthosRunWithEnv(
+	t *testing.T,
+	overrides map[string]string,
+	args ...string,
+) CommandResult {
+	t.Helper()
+
+	binary := filepath.Join(repo.EthosRoot, "bin", "coding-ethos-run")
+	command := append([]string{binary}, args...)
+	result := RunWithEnv(t, repo.Root, overrides, command...)
+
+	return result
+}
+
+// CodingEthosRunWithInput executes the dispatcher with provider payload stdin.
+func (repo Repo) CodingEthosRunWithInput(
+	t *testing.T,
+	input string,
+	args ...string,
+) CommandResult {
+	t.Helper()
+
+	binary := filepath.Join(repo.EthosRoot, "bin", "coding-ethos-run")
+	command := append([]string{binary}, args...)
+	result := repo.RunWithInput(t, input, command...)
+
+	return result
+}
+
+// SyncHookPolicyBundle installs the consumer-scoped policy bundle used by
+// hook-facing runtime commands.
+func (repo Repo) SyncHookPolicyBundle(t *testing.T) {
+	t.Helper()
+
+	compile := repo.CodingEthosRun(
+		t,
+		"policy",
+		"compile",
+		"--primary",
+		filepath.Join(repo.EthosRoot, "coding_ethos.yml"),
+		"--repo-ethos",
+		filepath.Join(repo.EthosRoot, "repo_ethos.yml"),
+		"--config",
+		filepath.Join(repo.EthosRoot, "config.yaml"),
+		"--out-dir",
+		repo.HookPolicyDir(t),
+	)
+	compile.RequireExit(t, 0)
+}
+
+// HookPolicyDir returns the installed policy directory for this repo's Git
+// common directory.
+func (repo Repo) HookPolicyDir(t *testing.T) string {
+	t.Helper()
+
+	gitCommon := repo.Git(
+		t,
+		"rev-parse",
+		"--path-format=absolute",
+		"--git-common-dir",
+	)
+	gitCommon.RequireExit(t, 0)
+
+	return filepath.Join(
+		strings.TrimSpace(gitCommon.Stdout),
+		"coding-ethos-hooks",
+		"policy",
+	)
+}
+
+// Run executes a real command with a bounded timeout.
+func Run(t *testing.T, cwd string, args ...string) CommandResult {
+	t.Helper()
+
+	return RunWithInput(t, cwd, "", args...)
+}
+
+// RunWithEnv executes a real command with per-command environment overrides.
+func RunWithEnv(
+	t *testing.T,
+	cwd string,
+	overrides map[string]string,
+	args ...string,
+) CommandResult {
+	t.Helper()
+
+	return runCommand(t, cwd, "", overrides, args...)
+}
+
+// RunWithInput executes a real command with a bounded timeout and stdin.
+func RunWithInput(
+	t *testing.T,
+	cwd string,
+	input string,
+	args ...string,
+) CommandResult {
+	t.Helper()
+
+	return runCommand(t, cwd, input, nil, args...)
+}
+
+func runCommand(
+	t *testing.T,
+	cwd string,
+	input string,
+	overrides map[string]string,
+	args ...string,
+) CommandResult {
+	t.Helper()
+
+	if len(args) == 0 {
+		t.Fatal("missing command")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+
+	cmd := safeexec.CommandContext(ctx, args[0], args[1:]...)
+	cmd.Dir = cwd
+	cmd.Env = commandEnvironmentWith(t, overrides)
+	cmd.Stdin = strings.NewReader(input)
+	configureCommandProcessGroup(cmd)
+	configureCommandCancellation(cmd)
+
+	var (
+		stdout bytes.Buffer
+		stderr bytes.Buffer
+	)
+
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	code := 0
+
+	if err != nil {
+		var exitErr *exec.ExitError
+		switch {
+		case ctx.Err() != nil:
+			terminationErr := terminateCommandProcessGroup(cmd)
+			if terminationErr != nil && !errors.Is(terminationErr, os.ErrProcessDone) {
+				t.Fatalf(
+					"terminate timed-out command %q: %v",
+					strings.Join(args, " "),
+					terminationErr,
+				)
+			}
+
+			t.Fatalf("command timed out: %s", strings.Join(args, " "))
+		case errors.As(err, &exitErr):
+			code = exitErr.ExitCode()
+		default:
+			t.Fatalf("run command %q: %v", strings.Join(args, " "), err)
+		}
+	}
+
+	return CommandResult{
+		Args:     append([]string(nil), args...),
+		Cwd:      cwd,
+		Stdout:   stdout.String(),
+		Stderr:   stderr.String(),
+		Combined: stdout.String() + stderr.String(),
+		Code:     code,
+	}
+}
+
+// RequireExit fails when the command exit code differs from the expected code.
+func (result CommandResult) RequireExit(t *testing.T, want int) {
+	t.Helper()
+
+	if result.Code != want {
+		t.Fatalf(
+			"exit code = %d, want %d\ncommand: %s\nstdout:\n%s\nstderr:\n%s",
+			result.Code,
+			want,
+			strings.Join(result.Args, " "),
+			result.Stdout,
+			result.Stderr,
+		)
+	}
+}
+
+// RequireContains fails when the combined output does not include text.
+func (result CommandResult) RequireContains(t *testing.T, text string) {
+	t.Helper()
+
+	if !strings.Contains(result.Combined, text) {
+		t.Fatalf(
+			"output missing %q\ncommand: %s\nstdout:\n%s\nstderr:\n%s",
+			text,
+			strings.Join(result.Args, " "),
+			result.Stdout,
+			result.Stderr,
+		)
+	}
+}
+
+// TraceFiles returns retained lint trace files for the reference repo.
+func (repo Repo) TraceFiles(t *testing.T) []string {
+	t.Helper()
+
+	matches, err := filepath.Glob(
+		filepath.Join(repo.Root, ".coding-ethos", "lint-runs", "*.json"),
+	)
+	if err != nil {
+		t.Fatalf("glob trace files: %v", err)
+	}
+
+	return matches
+}
+
+// SingleTrace returns the only retained lint trace content.
+func (repo Repo) SingleTrace(t *testing.T) string {
+	t.Helper()
+
+	matches := repo.TraceFiles(t)
+	if len(matches) != 1 {
+		t.Fatalf("trace files = %#v, want exactly one", matches)
+	}
+
+	content, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatalf("read trace %s: %v", matches[0], err)
+	}
+
+	return string(content)
+}
+
+// ResetTraces removes retained lint traces between scenarios.
+func (repo Repo) ResetTraces(t *testing.T) {
+	t.Helper()
+
+	err := os.RemoveAll(filepath.Join(repo.Root, ".coding-ethos", "lint-runs"))
+	if err != nil {
+		t.Fatalf("remove lint trace directory: %v", err)
+	}
+}
+
+// Touch rewrites a file so tests can create controlled changes in the repo.
+func (repo Repo) Touch(t *testing.T, path, content string) {
+	t.Helper()
+
+	fullPath := filepath.Join(repo.Root, filepath.FromSlash(path))
+
+	err := os.MkdirAll(filepath.Dir(fullPath), e2eDirMode)
+	if err != nil {
+		t.Fatalf("create parent directory: %v", err)
+	}
+
+	err = os.WriteFile(fullPath, []byte(content), e2eFileMode)
+	if err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func copyTree(destination, source string) error {
+	return copyTreeFiltered(destination, source, nil)
+}
+
+func copyRuntimePreCommit(runtimeRoot, ethosRoot string) error {
+	return copyTreeFiltered(
+		filepath.Join(runtimeRoot, "pre-commit"),
+		filepath.Join(ethosRoot, "pre-commit"),
+		isGeneratedRuntimeState,
+	)
+}
+
+func isGeneratedRuntimeState(rel string) bool {
+	for part := range strings.SplitSeq(filepath.ToSlash(rel), "/") {
+		switch part {
+		case optionalVenvRuntimeEntry, ".ruff_cache", "__pycache__":
+			return true
+		}
+	}
+
+	return false
+}
+
+func copyTreeFiltered(
+	destination string,
+	source string,
+	skip func(string) bool,
+) error {
+	sourceRoot, err := os.OpenRoot(source)
+	if err != nil {
+		return fmt.Errorf("open reference fixture source %s: %w", source, err)
+	}
+	defer sourceRoot.Close()
+
+	err = os.MkdirAll(destination, e2eDirMode)
+	if err != nil {
+		return fmt.Errorf("create reference fixture destination %s: %w", destination, err)
+	}
+
+	destinationRoot, err := os.OpenRoot(destination)
+	if err != nil {
+		return fmt.Errorf("open reference fixture destination %s: %w", destination, err)
+	}
+	defer destinationRoot.Close()
+
+	err = filepath.WalkDir(
+		source,
+		func(path string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return fmt.Errorf("walk reference fixture path %s: %w", path, walkErr)
+			}
+
+			return copyTreeEntry(
+				path,
+				source,
+				sourceRoot,
+				destinationRoot,
+				entry,
+				skip,
+			)
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("copy reference fixture tree from %s: %w", source, err)
+	}
+
+	return nil
+}
+
+func copyTreeEntry(
+	path string,
+	source string,
+	sourceRoot *os.Root,
+	destinationRoot *os.Root,
+	entry fs.DirEntry,
+	skip func(string) bool,
+) error {
+	rel, err := filepath.Rel(source, path)
+	if err != nil {
+		return fmt.Errorf("relativize reference fixture path %s: %w", path, err)
+	}
+
+	if rel != "." && skip != nil && skip(rel) {
+		if entry.IsDir() {
+			return filepath.SkipDir
+		}
+
+		return nil
+	}
+
+	info, err := entry.Info()
+	if err != nil {
+		return fmt.Errorf("inspect reference fixture path %s: %w", path, err)
+	}
+
+	if entry.IsDir() {
+		err = destinationRoot.MkdirAll(rel, info.Mode().Perm())
+		if err != nil {
+			return fmt.Errorf("create reference fixture directory %s: %w", path, err)
+		}
+
+		return nil
+	}
+
+	if !info.Mode().IsRegular() {
+		return apperror.Wrapf(
+			apperror.StaticError("unsupported reference entry %s"),
+			"unsupported reference entry %s",
+			path,
+		)
+	}
+
+	content, err := sourceRoot.ReadFile(rel)
+	if err != nil {
+		return fmt.Errorf("read reference fixture path %s: %w", path, err)
+	}
+
+	err = destinationRoot.WriteFile(rel, content, info.Mode().Perm())
+	if err != nil {
+		return fmt.Errorf("write reference fixture path %s: %w", path, err)
+	}
+
+	return nil
+}
+
+func buildInstrumentedCommand(t *testing.T, ethosRoot, runtimeRoot, command string) {
+	t.Helper()
+
+	args := []string{
+		"build",
+		"-cover",
+		"-coverpkg=./...",
+		"-buildvcs=false",
+		"-o",
+		filepath.Join(runtimeRoot, "bin", command),
+		"./cmd/" + command,
+	}
+	result := Run(t, filepath.Join(ethosRoot, "go"), append([]string{"go"}, args...)...)
+	result.RequireExit(t, 0)
+}

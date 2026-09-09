@@ -1,0 +1,267 @@
+<!-- SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com> -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+
+# CI/CD And SARIF
+
+Local hooks are the first gate. CI is the independent gate that still runs when
+a developer or agent bypasses local enforcement.
+
+`coding-ethos` emits SARIF 2.1.0 from the same normalized diagnostics used by
+hook and lint-capture output. SARIF results include stable policy IDs, source
+tool codes, ETHOS principle IDs, skill IDs, file and line locations,
+remediation advice, CEL provenance when applicable, policy coverage, and audit
+properties.
+
+For product uses beyond CI upload, including MCP remediation, finding
+deduplication, audit bundles, and editor diagnostics, see
+[`SARIF_USES.md`](SARIF_USES.md) and
+[`SARIF_EDITOR_INTEGRATION.md`](SARIF_EDITOR_INTEGRATION.md).
+
+The repository CI stack now uses multiple independent code-scanning and
+workflow-security gates:
+
+- Coding Ethos SARIF for ETHOS/CEL/managed-tool policy enforcement.
+- CodeQL for GitHub Actions workflows, Go, and Python.
+- OSV-Scanner for dependency vulnerability evidence on PR, merge queue, `main`,
+  scheduled, and manual runs.
+- Zizmor for GitHub Actions security posture with SARIF upload.
+- Managed `actionlint` for workflow syntax and semantics before policy gates
+  depend on those workflows.
+- OpenSSF Scorecard for public supply-chain posture signals.
+
+Those tools are complementary. Coding Ethos owns repo-specific policy and agent
+workflow rules; CodeQL, OSV, Zizmor, actionlint, and Scorecard provide
+independent witnesses for security, dependency, workflow, and supply-chain
+posture.
+
+## Output Contract
+
+Use `--sarif` on lint result paths:
+
+```bash
+bin/coding-ethos-run policy-lint --sarif --scope files --files path/to/file.py
+bin/coding-ethos-run policy-lint --sarif --replay .coding-ethos/lint-runs/<trace>.json
+```
+
+Captured managed tools can also emit SARIF:
+
+```bash
+bin/coding-ethos-run policy-lint --managed-capture-tool ruff --sarif -- check path/to/file.py
+```
+
+Sandboxed managed capture is opt-in while the native profile is hardened:
+
+```bash
+bin/coding-ethos-run policy-lint --managed-capture-tool ruff --sarif -- check path/to/file.py
+```
+
+On Linux, managed tools that declare sandbox profiles run in the native
+sandbox. SARIF records the selected backend, profile, declared capabilities,
+and backend denials under `runs[].properties.sandbox`.
+Pathless sandbox denials remain run-level evidence for code-scanning
+compatibility and are preserved in `.coding-ethos` lint traces.
+
+SARIF is intentionally not supported for explanatory or aggregate analysis
+commands such as `--explain` and `--analyze-log`; those are operator summaries,
+not per-result diagnostic reports.
+
+## Code Scanning Metadata
+
+The SARIF encoder follows the current GitHub code-scanning subset and the
+OASIS SARIF 2.1.0 tracking model:
+
+- Artifact URIs are repository-relative whenever the source diagnostic is
+  repository-relative. This keeps annotations tied to checked-in files and
+  avoids leaking absolute workstation paths.
+- Each run has `automationDetails.id` derived from the lint scope unless an
+  explicit SARIF category is supplied. CI uploads use the configured category
+  with the SARIF `category/` form so GitHub code scanning keeps a stable
+  configuration identity across pull requests and `main`.
+- Each run records `invocations[].workingDirectory.uri` as the repository root
+  marker and `executionSuccessful` as the inverse of the blocking result.
+- Each run records `properties.policy_coverage` with the policies, ETHOS
+  principles, skills, and source tools represented by the normalized result.
+  This makes a no-finding or low-finding run useful as evidence that expected
+  defenses executed.
+- Each result includes `ruleId`, `ruleIndex`, rule metadata, ETHOS properties,
+  and deterministic `partialFingerprints` for result tracking and
+  deduplication.
+- CEL-backed diagnostics include `implementation`, `input_schema_version`,
+  `policy_source`, and `cel_expression` in rule/result properties. SARIF
+  consumers can explain where a policy came from without reparsing the policy
+  bundle.
+- Rules include `precision` and security findings include
+  `security-severity`, allowing code-scanning surfaces to prioritize high-value
+  alerts without inflating ordinary style findings into security issues.
+- Record-only policy context is not emitted as SARIF results. It remains
+  available in TOON/JSON lint traces, but code-scanning uploads should contain
+  actionable diagnostics only.
+- Pathless policy findings are omitted from code-scanning SARIF. GitHub rejects
+  uploaded results without at least one location, and coding-ethos must not
+  invent repository-root locations that create noisy alerts at `.` line 0.
+  Aggregate/pathless findings remain available in TOON/JSON lint traces.
+
+Do not emit SARIF fields that are not grounded in actual evidence. In
+particular, `fixes`, `codeFlows`, `relatedLocations`, baseline state, and CWE
+taxa should only be added when the underlying policy or tool result supplies
+that information explicitly.
+
+## Reusable GitHub Workflow
+
+Consumer GitHub and GitLab SARIF gates are generated by default through the
+normal managed config sync path:
+
+```yaml
+generated_config:
+  ci:
+    github_actions:
+      enabled: true
+    gitlab:
+      enabled: true
+```
+
+`make sync-tool-configs` writes the enabled CI files and records them in
+`.coding-ethos/tool-config-hashes.json`; `make check-tool-configs` detects drift.
+Set either `enabled` value to `false` only for a deliberate repo exception. CI
+files intentionally do not have a separate sync command.
+
+Generated CI does not expose a sandbox mode switch. Linux runners fail closed
+for sandbox-profiled managed tools when the native sandbox backend is
+unavailable; non-Linux runners do not claim Linux namespace sandboxing.
+
+The reusable workflow at `.github/workflows/coding-ethos-sarif.yml` builds the
+managed runtime, runs the configured project gate, emits SARIF, uploads it to
+GitHub code scanning, and preserves SARIF plus `.coding-ethos` traces as
+workflow artifacts. It defaults to `workflow_call` only. The repo-level CI
+workflow should call it once and own concurrency, required jobs, actionlint,
+package validation, and artifact attestations. Set
+`generated_config.ci.github_actions.standalone_triggers: true` only when a
+repo intentionally wants the generated SARIF workflow to run directly on
+`pull_request`, `push`, and `workflow_dispatch`.
+
+The generated workflow emits and uploads SARIF with an explicit
+`generated_config.ci.github_actions.sarif_category` value. The default is
+`policy`, which keeps GitHub code-scanning configuration identity stable when a
+repo calls the reusable workflow from `.github/workflows/ci.yml`. Repos that
+already have an established GitHub code-scanning stream can set this to the
+existing category, for example `.github/workflows/ci.yml:policy`. The linter
+also writes that category into SARIF `runAutomationDetails.id` using the
+SARIF `category/` form; this avoids GitHub treating the uploaded file as a
+different analysis stream from the same workflow.
+
+The SARIF job scopes file analysis to the event's changed files. Pull requests
+diff against the target branch, push events diff against the pushed commit
+range, and explicit `CODING_ETHOS_FILES` input remains available for controlled
+reruns. If CI cannot prove a safe event diff, it emits an empty SARIF result
+instead of falling back to a whole-repo scan; broad historical audits should be
+run through an explicit audit workflow or local operator command.
+
+```yaml
+name: coding-ethos
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version-file: coding-ethos/go/go.mod
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+      - run: make -C coding-ethos build
+      - run: >-
+          coding-ethos/bin/coding-ethos-run policy-tool actionlint
+          .github/workflows/ci.yml
+          .github/workflows/coding-ethos-sarif.yml
+
+  policy:
+    uses: ./coding-ethos/.github/workflows/coding-ethos-sarif.yml
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+```
+
+If the repository does not check out `coding-ethos` as a submodule, replace the
+`make -C coding-ethos` paths with the repository-local install path used by the
+project.
+
+Distribution jobs should run independently of the test matrix, validate built
+metadata with `uvx twine check dist/*`, upload `dist/*` as artifacts, and use
+GitHub artifact attestations when publishing build outputs. The build job needs
+`attestations: write` and `id-token: write`; ordinary test and policy jobs
+should keep narrower `contents: read` permissions.
+
+## Reusable GitLab CI Template
+
+The reusable GitLab template at `ci/gitlab/coding-ethos-sarif.yml` exposes a
+hidden `.coding_ethos_sarif` job. Consumers include it, extend it, and override
+variables only when their checkout layout differs.
+
+```yaml
+include:
+  - local: coding-ethos/ci/gitlab/coding-ethos-sarif.yml
+
+coding_ethos:
+  extends: .coding_ethos_sarif
+  image: golang:1.24
+```
+
+GitLab runners should use the same compiled bundle and managed toolchain as
+local hooks, then keep SARIF as a job artifact. The generated GitLab config now
+uses policy/test/build stages, `interruptible: true`, job timeouts, artifact
+expiry, and optional test/build/package-check commands from
+`generated_config.ci.gitlab.*`. Projects can wire the SARIF artifact into their
+own merge-request annotation or security-reporting layer as needed. GitLab is
+actively adding first-class SARIF ingestion, but the durable contract is still
+stable identifiers, ordered locations, and consistent severity mapping. Like
+the GitHub workflow, the GitLab job delegates diff-base selection to
+`coding-ethos-run ci-sarif --provider gitlab`, which scopes merge requests to
+the target branch diff, push pipelines to
+`$CI_COMMIT_BEFORE_SHA..$CI_COMMIT_SHA`, and uses an empty SARIF result when no
+safe diff base is available.
+
+## Operator Rules
+
+- CI must run `make build` before policy commands so the compiled bundle,
+  generated tool configs, managed binaries, MCP settings, skills, and hook
+  runtime are in sync.
+- Reusable SARIF workflows should be invoked once from the repo-level CI
+  workflow. Avoid enabling both direct generated workflow triggers and a caller
+  workflow unless the duplicate checks are intentional.
+- CI jobs should have explicit timeouts and pull-request concurrency
+  cancellation. GitLab jobs should be interruptible unless they publish durable
+  release artifacts.
+- GitHub workflow YAML should be validated with managed `actionlint` as a
+  normal required job.
+- Dependency and workflow-security scanners should run as separate required
+  checks rather than being folded into one omnibus shell step. Keep OSV,
+  Zizmor, CodeQL, Scorecard, actionlint, and Coding Ethos SARIF independently
+  visible so regressions identify the failing control.
+- Build jobs should validate distributions before upload. For Python packages,
+  `uvx twine check dist/*` catches broken metadata before artifacts leave CI.
+- Build artifacts that may be consumed outside CI should have provenance
+  attestations when running on GitHub Actions.
+- CI should run `make check` or the project-specific equivalent as the blocking
+  gate. SARIF upload is an audit and review surface, not the only enforcement
+  mechanism.
+- SARIF artifacts should be retained with `.coding-ethos` traces so reviewers
+  can replay failures without rerunning the underlying tools. MCP trace lookup
+  expects lint trace file names from `.coding-ethos/lint-runs/`, not arbitrary
+  paths, and replays them through the normalized lint trace reader.
+- Keep result volume scoped. GitHub code scanning rejects oversized SARIF
+  uploads and only displays a bounded number of results, so CI should prefer
+  changed-file scopes for PR feedback, pass only files that still exist, and
+  retain full traces as artifacts for audit. Generated GitHub and GitLab CI
+  now call `bin/coding-ethos-run ci-sarif --provider ...`; changed-file
+  discovery, deleted-file filtering, SARIF temp-file handling, and policy-lint
+  invocation are Go-owned instead of repeated shell snippets.

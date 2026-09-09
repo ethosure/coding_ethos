@@ -1,0 +1,9 @@
+<!-- SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com> -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+
+# policy-lint-basic.pkg
+
+This package contains real Python inputs for coding-ethos managed lint e2e
+tests. The files are intentionally small so scenarios can assert clean Ruff
+execution and deterministic Ruff findings without fake linters, mocked hook
+executables, or synthetic output.

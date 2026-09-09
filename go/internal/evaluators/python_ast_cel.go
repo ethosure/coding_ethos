@@ -1,0 +1,91 @@
+// SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package evaluators
+
+import (
+	"strings"
+
+	"github.com/ethosure/coding_ethos/go/internal/celexpr"
+)
+
+func celPythonASTFacts(
+	context Context,
+	expression string,
+) []celexpr.PythonASTFactInput {
+	if !celExpressionNeedsPythonAST(expression) {
+		return nil
+	}
+
+	sources, err := pythonSources(context)
+	if err != nil {
+		return nil
+	}
+
+	facts := []celexpr.PythonASTFactInput{}
+
+	for _, source := range sources {
+		sourceFacts, err := collectPythonASTFacts(source)
+		if err != nil {
+			continue
+		}
+
+		for _, fact := range sourceFacts {
+			facts = append(facts, pythonASTFactInput(fact))
+		}
+	}
+
+	return facts
+}
+
+func celExpressionNeedsPythonAST(expression string) bool {
+	return strings.Contains(expression, "python_ast")
+}
+
+func pythonASTFactInput(fact pythonASTFact) celexpr.PythonASTFactInput {
+	return celexpr.PythonASTFactInput{
+		File:                     fact.File,
+		Language:                 fact.Language,
+		NodeKind:                 fact.NodeKind,
+		SymbolKind:               fact.SymbolKind,
+		SymbolName:               fact.SymbolName,
+		SymbolPath:               fact.SymbolPath,
+		ParentSymbolPath:         fact.ParentSymbolPath,
+		EnclosingFunction:        fact.EnclosingFunction,
+		EnclosingSymbol:          fact.EnclosingSymbol,
+		Text:                     fact.Text,
+		ReturnAnnotation:         fact.ReturnAnnotation,
+		ExceptionType:            fact.ExceptionType,
+		ExceptionAction:          fact.ExceptionAction,
+		ImportModule:             fact.ImportModule,
+		CallName:                 fact.CallName,
+		AnnotationRole:           fact.AnnotationRole,
+		SuppressionLabel:         fact.SuppressionLabel,
+		LoggerName:               fact.LoggerName,
+		LoggerMethod:             fact.LoggerMethod,
+		Line:                     int64(fact.Line),
+		Column:                   int64(fact.Column),
+		EndLine:                  int64(fact.EndLine),
+		ParameterCount:           int64(fact.ParameterCount),
+		HasVarargs:               fact.HasVarargs,
+		HasKwargs:                fact.HasKwargs,
+		ModuleLevel:              fact.ModuleLevel,
+		UnderClass:               fact.UnderClass,
+		UnderConditional:         fact.UnderConditional,
+		UnderFunction:            fact.UnderFunction,
+		UnderTry:                 fact.UnderTry,
+		UnderTypeChecking:        fact.UnderTypeChecking,
+		IsImport:                 fact.IsImport,
+		IsImportFallback:         fact.IsImportFallback,
+		IsDynamicImport:          fact.IsDynamicImport,
+		IsAssignedLambda:         fact.IsAssignedLambda,
+		IsClosureFactory:         fact.IsClosureFactory,
+		IsSuppression:            fact.IsSuppression,
+		IsOptionalReturn:         fact.IsOptionalReturn,
+		IsBareExcept:             fact.IsBareExcept,
+		IsSilentExcept:           fact.IsSilentExcept,
+		IsUnstructuredLogMessage: fact.IsUnstructuredLogMessage,
+		IsDirectImport:           fact.IsDirectImport,
+		IsUnexplainedTypeIgnore:  fact.IsUnexplainedTypeIgnore,
+	}
+}

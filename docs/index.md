@@ -1,0 +1,117 @@
+<!-- SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com> -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+
+# Coding Ethos Docs
+
+`coding-ethos` is policy as code for AI coding agents. It turns a repository's
+engineering principles into generated agent instructions, CEL policy checks,
+Git hooks, MCP tools, SARIF output, runtime sandbox evidence, and CI gates.
+
+Current OpenSSF Best Practices status: **Silver**. Gold readiness and remaining
+gaps are tracked in the [OpenSSF Gold checklist](OPENSSF_GOLD_CHECKLIST.md).
+
+![coding-ethos MCP and SARIF demo](assets/coding-ethos-demo.gif)
+
+## Start Here
+
+- [README](../README.md): project overview, quick start, supported agents, and
+  common workflows.
+- [Repository analysis](REPOSITORY_ANALYSIS.md): source-of-truth boundaries,
+  generated artifacts, and verification model.
+- [Strategic roadmap](STRATEGIC_ROADMAP.md): major platform directions for MCP,
+  CEL, SARIF, sandboxing, and agent remediation loops.
+- [Capability surface decision guide](CAPABILITY_SURFACE_DECISION.md): routing
+  rules for choosing CEL/policy/hooks, generated skills, MCP, CLI,
+  SARIF/code-intel/outputsurface, or provider registries.
+- [AST/CEL/SARIF architecture](AST_CEL_SARIF_ARCHITECTURE.md): the preferred
+  path for turning parsed source facts into principle-owned CEL policy,
+  stable SARIF, and code-intelligence storage.
+- [Code intelligence](CODE_INTEL.md): local DuckDB, duckdb-vss, Tree-sitter
+  chunks, SARIF/remediation evidence, and MCP retrieval surfaces.
+- [Agent proxy foundation](AGENT_PROXY.md): opt-in proxy trust boundary,
+  provider-neutral event envelope, code-intel ledger, CEL facts, SARIF
+  properties, and operator model.
+- [Trust signals](TRUST_SIGNALS.md): OpenSSF Scorecard, Best Practices badge,
+  security posture, and publication checklist.
+- [OpenSSF Gold checklist](OPENSSF_GOLD_CHECKLIST.md): `.bestpractices.json`
+  evidence, remaining Gold gaps, and remediation plan.
+- [Security assurance case](SECURITY_ASSURANCE_CASE.md): security claims,
+  evidence, input-validation posture, and known limits.
+- [Gold security posture](GOLD_SECURITY_POSTURE.md): cryptography
+  applicability, TLS verification, site hardening, and release signing.
+- [Build reproducibility](BUILD_REPRODUCIBILITY.md): repeatable build inputs,
+  deterministic Go flags, generated artifact checks, and known limits.
+- [Supply-chain attestations](SUPPLY_CHAIN_ATTESTATIONS.md): Scorecard
+  publishing, GitHub artifact provenance, SBOMs, PyPI Trusted Publishing,
+  checksums, and verification commands.
+- [Threat model](THREAT_MODEL.md): protected assets, actors, trust
+  boundaries, risks, and out-of-scope claims.
+- [Release process](RELEASE.md): versioning, artifact, checklist, and release
+  note expectations.
+- [Discussions plan](DISCUSSIONS.md): recommended GitHub Discussions
+  categories and issue/discussion boundaries.
+- [Demo](DEMO.md): verified MCP, command-block, lint-check, and SARIF excerpts
+  plus a recording plan.
+- [Comparison](COMPARISON.md): how coding-ethos relates to pre-commit, CodeQL,
+  Semgrep, OPA, branch protection, and plain agent instructions.
+- [Integrations](INTEGRATIONS.md): Codex, Claude Code, Gemini CLI, MCP,
+  GitHub Actions, GitLab CI, SARIF consumers, and managed static analysis.
+
+## AI Agent Policy Enforcement
+
+`coding-ethos` is built for agentic development workflows where Codex, Claude
+Code, Gemini CLI, and human contributors need the same enforceable rules.
+
+- [Capability surface decision guide](CAPABILITY_SURFACE_DECISION.md): choose
+  the owning public surface before adding new agent-facing capabilities.
+- [MCP server](MCP_SERVER.md): stdio MCP tools for policy checks, lint advice,
+  SARIF remediation, risk summaries, and capability inspection.
+- [Code intelligence](CODE_INTEL.md): MCP-backed search over stored SARIF,
+  remediation outcomes, hook traces, Tree-sitter chunks, and vector metadata.
+- [Integrations](INTEGRATIONS.md): setup notes for Codex, Claude Code, Gemini
+  CLI, MCP clients, GitHub Actions, GitLab CI, SARIF consumers, and managed
+  tools.
+- [Provider capability matrix](PROVIDER_CAPABILITY_MATRIX.md): generated
+  adapter support, partial-support, unsupported-surface, MCP, memory, and
+  verification coverage by provider.
+- [Runtime sandboxing](RUNTIME_SANDBOXING.md): native namespaces, cgroups, seccomp,
+  network isolation, and least-privilege tool capabilities.
+- [Red-team suite](RED_TEAM_SUITE.md): adversarial coverage for hook bypass,
+  shell parsing, protected paths, MCP framing, SARIF, and sandbox behavior.
+
+## CEL Policy Language
+
+CEL lets repos express narrow custom policies without adding a new Go evaluator
+for every rule. Principle-owned CEL policies live with the ETHOS principle they
+enforce.
+
+- [Policy language strategy](POLICY_LANGUAGE_STRATEGY.md): CEL inputs, helper
+  functions, staged migration path, and limits.
+- [AST/CEL/SARIF architecture](AST_CEL_SARIF_ARCHITECTURE.md): source-fact
+  collection, CEL evaluation, SARIF emission, and code-intel persistence.
+- [MCP server](MCP_SERVER.md): policy explanation and policy check tools that
+  expose compiled CEL behavior to agents.
+
+## SARIF And Code Scanning
+
+SARIF turns local policy and static-analysis evidence into code-scanning,
+artifact, trend, and remediation workflows.
+
+- [CI/CD SARIF](CI_CD_SARIF.md): generated GitHub Actions and GitLab CI gates.
+- [SARIF uses](SARIF_USES.md): remediation advice, risk summaries, trend
+  analysis, editor loops, and policy feedback.
+- [SARIF editor integration](SARIF_EDITOR_INTEGRATION.md): local workflows for
+  developers and agents.
+- [Code intelligence](CODE_INTEL.md): persistent SARIF and AST-backed
+  retrieval for repeated-failure analysis and remediation memory.
+
+## Hook And Tool Runtime
+
+- [Hook runtime bootstrap](HOOK_RUNTIME_BOOTSTRAP.md): checkout-local runtime
+  artifacts, repair behavior, and consumer hook entrypoints.
+- [Runtime publication](RUNTIME_PUBLICATION.md): PyPI generator boundaries and
+  the release-asset model for future compiled Go runtime distribution.
+- [Lint capture Go flow](LINT_CAPTURE_GO_FLOW.md): managed lint capture through
+  compiled Go request, target resolution, config validation, and normalized
+  output.
+- [Source docs index](SOURCE_DOCS.md): full document list for maintainers.

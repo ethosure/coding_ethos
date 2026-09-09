@@ -1,0 +1,420 @@
+// SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package hooks
+
+import (
+	"os"
+	"sort"
+	"strings"
+)
+
+const (
+	providerClaude      = "claude"
+	providerCodex       = "codex"
+	providerCodingEthos = "coding-ethos"
+	providerGemini      = "gemini"
+	providerKimi        = "kimi"
+)
+
+const (
+	eventPreToolUse       = "PreToolUse"
+	eventPostToolUse      = "PostToolUse"
+	eventPostToolBatch    = "PostToolBatch"
+	eventSessionStart     = "SessionStart"
+	eventSessionEnd       = "SessionEnd"
+	eventSubagentStart    = "SubagentStart"
+	eventSubagentStop     = "SubagentStop"
+	eventUserPromptSubmit = "UserPromptSubmit"
+	eventStop             = "Stop"
+	toolBash              = "Bash"
+)
+
+type Event struct {
+	ToolInput           map[string]any `json:"tool_input,omitempty"`
+	ToolResponse        map[string]any `json:"tool_response,omitempty"`
+	ContractVersion     string         `json:"contract_version,omitempty"`
+	CorrelationID       string         `json:"correlation_id,omitempty"`
+	ProviderHint        string         `json:"provider,omitempty"`
+	Cwd                 string         `json:"cwd,omitempty"`
+	HookEventName       string         `json:"hook_event_name"`
+	Matcher             string         `json:"matcher,omitempty"`
+	Model               string         `json:"model,omitempty"`
+	SessionID           string         `json:"session_id,omitempty"`
+	Source              string         `json:"source,omitempty"`
+	ToolName            string         `json:"tool_name,omitempty"`
+	TranscriptPath      string         `json:"transcript_path,omitempty"`
+	ContextWindowTokens int            `json:"context_window_tokens,omitempty"`
+}
+
+func (event Event) Provider() string {
+	providerHint := strings.ToLower(strings.TrimSpace(event.ProviderHint))
+	switch {
+	case strings.Contains(providerHint, providerCodingEthos):
+		return providerCodingEthos
+	case strings.Contains(providerHint, providerKimi):
+		return providerKimi
+	case strings.Contains(providerHint, providerGemini):
+		return providerGemini
+	case strings.Contains(providerHint, providerCodex):
+		return providerCodex
+	case strings.Contains(providerHint, providerClaude):
+		return providerClaude
+	}
+
+	source := strings.ToLower(strings.TrimSpace(event.Source))
+	switch {
+	case strings.Contains(source, providerCodingEthos):
+		return providerCodingEthos
+	case strings.Contains(source, providerKimi):
+		return providerKimi
+	case strings.Contains(source, providerGemini):
+		return providerGemini
+	case strings.Contains(source, providerCodex):
+		return providerCodex
+	case strings.Contains(source, providerClaude):
+		return providerClaude
+	default:
+		return providerFromEnvironment()
+	}
+}
+
+func providerFromEnvironment() string {
+	switch {
+	case strings.TrimSpace(os.Getenv("CODEX_THREAD_ID")) != "" ||
+		strings.TrimSpace(os.Getenv("CODEX_CI")) != "" ||
+		strings.TrimSpace(os.Getenv("CODEX_MANAGED_BY_NPM")) != "":
+		return providerCodex
+	case strings.TrimSpace(os.Getenv("GEMINI_CLI")) != "":
+		return providerGemini
+	case strings.TrimSpace(os.Getenv("KIMI_CODE_HOME")) != "":
+		return providerKimi
+	case strings.TrimSpace(os.Getenv("CLAUDECODE")) != "" ||
+		strings.TrimSpace(os.Getenv("CLAUDE_CODE_ENTRYPOINT")) != "":
+		return providerClaude
+	default:
+		return ""
+	}
+}
+
+func (event Event) Command() string {
+	if event.ToolInput == nil {
+		return ""
+	}
+
+	command, ok := event.ToolInput["command"].(string)
+	if !ok {
+		return ""
+	}
+
+	return command
+}
+
+func (event Event) StrategicIntent() string {
+	if event.ToolInput == nil {
+		return ""
+	}
+
+	for _, key := range []string{"strategic_intent", "update_topic", "intent"} {
+		value, ok := event.ToolInput[key].(string)
+		if ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+
+	return ""
+}
+
+func (event Event) ActiveTodo() string {
+	if event.ToolInput == nil {
+		return ""
+	}
+
+	todos, ok := event.ToolInput["todos"].([]any)
+	if !ok {
+		return ""
+	}
+
+	firstTodo := ""
+
+	for _, item := range todos {
+		todo, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		content := strings.TrimSpace(stringMapValue(todo, "content"))
+		if content == "" {
+			continue
+		}
+
+		if firstTodo == "" {
+			firstTodo = content
+		}
+
+		if strings.EqualFold(stringMapValue(todo, "status"), "in_progress") {
+			return content
+		}
+	}
+
+	return firstTodo
+}
+
+func stringMapValue(values map[string]any, key string) string {
+	value, ok := values[key].(string)
+	if !ok {
+		return ""
+	}
+
+	return value
+}
+
+func (event Event) Files() []string {
+	if event.ToolInput == nil {
+		return nil
+	}
+
+	files := []string{}
+
+	for _, key := range []string{"file_path", "path", "notebook_path"} {
+		if file, ok := event.ToolInput[key].(string); ok {
+			files = appendNonEmptyFile(files, file)
+		}
+	}
+
+	for _, key := range []string{"files", "paths"} {
+		for _, file := range stringList(event.ToolInput[key]) {
+			files = appendNonEmptyFile(files, file)
+		}
+	}
+
+	return dedupeStrings(files)
+}
+
+func appendNonEmptyFile(files []string, candidate string) []string {
+	path := strings.TrimSpace(candidate)
+	if path == "" {
+		return files
+	}
+
+	return append(files, path)
+}
+
+func (event Event) Content() string {
+	if event.ToolInput == nil {
+		return ""
+	}
+
+	contents := []string{}
+
+	for _, key := range []string{
+		"content",
+		"new_string",
+		"prompt",
+		"text",
+		"title",
+		"body",
+		"description",
+	} {
+		if content, ok := event.ToolInput[key].(string); ok {
+			contents = append(contents, content)
+		}
+	}
+
+	return strings.Join(contents, "\n")
+}
+
+func (event Event) OldContent() string {
+	if event.ToolInput == nil {
+		return ""
+	}
+
+	for _, key := range []string{"old_string", "old_content", "before"} {
+		if content, ok := event.ToolInput[key].(string); ok {
+			return content
+		}
+	}
+
+	return ""
+}
+
+func (event Event) ToolOutput() string {
+	if event.ToolResponse == nil {
+		return ""
+	}
+
+	output := firstStringValue(
+		event.ToolResponse,
+		"stdout",
+		"output",
+		"result",
+		"text",
+		"content",
+	)
+
+	stderr := firstStringValue(event.ToolResponse, "stderr")
+	if output != "" && stderr != "" {
+		return output + "\n" + stderr
+	}
+
+	if output != "" {
+		return output
+	}
+
+	return stderr
+}
+
+func (event Event) ReturnCode() int {
+	if event.ToolResponse == nil {
+		return 0
+	}
+
+	for _, key := range []string{
+		"return_code",
+		"returnCode",
+		"exitCode",
+		"exit_code",
+		"code",
+	} {
+		value, ok := event.ToolResponse[key]
+		if !ok {
+			continue
+		}
+
+		switch typed := value.(type) {
+		case int:
+			return typed
+		case float64:
+			return int(typed)
+		case string:
+			if typed == "" || typed == "0" {
+				return 0
+			}
+
+			return 1
+		}
+	}
+
+	if responseStatusFailed(event.ToolResponse) {
+		return 1
+	}
+
+	return 0
+}
+
+func (event Event) HasReturnCode() bool {
+	if event.ToolResponse == nil {
+		return false
+	}
+
+	for _, key := range []string{
+		"return_code",
+		"returnCode",
+		"exitCode",
+		"exit_code",
+		"code",
+	} {
+		if _, ok := event.ToolResponse[key]; ok {
+			return true
+		}
+	}
+
+	return responseStatusFailed(event.ToolResponse)
+}
+
+// statusFailedValue is the shared "failed" status token used by tool
+// responses, hook output keyword scans, and proxy result summaries.
+const statusFailedValue = "failed"
+
+func responseStatusFailed(response map[string]any) bool {
+	for _, key := range []string{"status", "state", "outcome"} {
+		value, ok := response[key].(string)
+		if !ok {
+			continue
+		}
+
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "blocked", "error", statusFailedValue, "failure":
+			return true
+		}
+	}
+
+	return false
+}
+
+func (event Event) ToolInputKeys() []string {
+	return mapKeys(event.ToolInput)
+}
+
+func (event Event) ToolResponseKeys() []string {
+	return mapKeys(event.ToolResponse)
+}
+
+func firstStringValue(values map[string]any, keys ...string) string {
+	for _, key := range keys {
+		value, ok := values[key].(string)
+		if ok && value != "" {
+			return value
+		}
+	}
+
+	return ""
+}
+
+func mapKeys(values map[string]any) []string {
+	if values == nil {
+		return nil
+	}
+
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		if key != "" {
+			keys = append(keys, key)
+		}
+	}
+
+	sort.Strings(keys)
+
+	return keys
+}
+
+func stringList(value any) []string {
+	switch typed := value.(type) {
+	case []string:
+		return append([]string(nil), typed...)
+	case []any:
+		items := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if text, ok := item.(string); ok && text != "" {
+				items = append(items, text)
+			}
+		}
+
+		return items
+	case string:
+		if typed == "" {
+			return nil
+		}
+
+		return []string{typed}
+	default:
+		return nil
+	}
+}
+
+func dedupeStrings(values []string) []string {
+	seen := map[string]bool{}
+
+	deduped := make([]string, 0, len(values))
+	for _, value := range values {
+		key := value
+		if key == "" || seen[key] {
+			continue
+		}
+
+		seen[key] = true
+		deduped = append(deduped, key)
+	}
+
+	return deduped
+}

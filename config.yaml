@@ -1,0 +1,1571 @@
+# SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+version: 1
+
+project:
+  name: coding-ethos
+  review_context: Shared ETHOS generation and enforcement tooling.
+  ethos_candidates:
+    - ETHOS.md
+    - coding-ethos/ETHOS.md
+
+gemini:
+  enabled: false
+  model: gemini-2.5-flash
+  model_overrides: {}
+  service_tier: standard
+  service_tier_overrides: {}
+  thinking_budget_overrides: {}
+  repo_name: coding-ethos
+  repo_context: shared repository automation and engineering tooling
+  max_retries: 3
+  timeout_seconds: 900
+  initial_backoff_seconds: 1.0
+  max_concurrent_api_calls: 10
+  disable_safety_filters: true
+  cache:
+    enabled: true
+    ttl_seconds: 604800
+    dirname: gemini-cache
+    api_enabled: true
+    api_ttl_seconds: 3600
+  modal_allowlist_files: []
+
+style:
+  python_version: "3.13"
+  line_length: 88
+
+bundle:
+  local_bin_dirname: coding-ethos-hooks
+  bundle_dir_candidates:
+    - pre-commit
+    - coding-ethos/pre-commit
+  consumer_override_candidates:
+    - repo_config.yaml
+    - repo_config.yml
+    - coding-ethos.repo.yaml
+    - coding-ethos.repo.yml
+    - coding-ethos.pre-commit.yaml
+    - coding-ethos.pre-commit.yml
+
+sandbox:
+  read_write_paths:
+    - .coding-ethos/cache/
+    - .pytest_cache/
+    - .mypy_cache/
+    - .ruff_cache/
+    - .uv-cache/
+    - .venv/
+    - __pycache__/
+
+proxy:
+  # Opt-in HTTPS-interception gate for the agent API proxy. "off" disables
+  # interception and never provisions a CA; "required" requests interception
+  # but still demands the CODE_ETHOS_AGENT_PROXY_INTERCEPT runtime opt-in.
+  interception:
+    mode: "off"
+
+hooks:
+  output_format: auto
+  success_output: silent
+  parallel_groups: true
+  tool_timeout_seconds: 600
+  fail_severity_levels:
+    - error
+    - fatal
+    - critical
+  warn_severity_levels:
+    - warning
+    - warn
+
+similarity:
+  enabled: true
+  minhash_size: 128
+  shingle_size: 5
+  lsh_bands: 16
+  lsh_rows: 8
+  min_symbol_lines: 5
+  exact_normalized: true
+  candidate_threshold: 0.7
+  structural_threshold: 0.8
+  max_matches: 10
+
+generated_config:
+  ci:
+    github_actions:
+      enabled: true
+      coding_ethos_path: .
+      gate_command: make check
+      sarif_category: .github/workflows/ci.yml:policy
+      standalone_triggers: false
+      timeout_minutes: 30
+    gitlab:
+      enabled: true
+      coding_ethos_path: .
+      gate_command: make check
+      test_command: uv run pytest
+      build_command: uv build
+      package_check_command: uvx twine check dist/*
+
+syntax:
+  file_syntax:
+    enabled: true
+    extensions:
+      - .json
+      - .toml
+      - .yaml
+      - .yml
+  merge_conflict:
+    enabled: true
+    markers:
+      - '<<<<<<<'
+      - '======='
+      - '>>>>>>>'
+      - '|||||||'
+
+policy:
+  expressions:
+    - id: hook.changed_file_scope
+      scope: file
+      severity: block
+      mode: block
+      protected: true
+      allow_override: false
+      allow_severity_weaken: false
+      tools: []
+      hook_events: []
+      lint_scopes:
+        - files
+        - staged
+        - smoke
+        - full
+      principle_ids:
+        - static-analysis-is-the-first-line-of-defense
+        - validation-at-the-gate
+        - functional-testing-is-the-proof
+      skill_id: managed-toolchain
+      message: >-
+        Hook-stage path-sensitive checks must scope to changed files before
+        running.
+      advice: >-
+        Use hook-provided file lists in pre-commit and pre-push command
+        implementations before invoking whole-surface or configured-path
+        runners.
+      when: >-
+        hook_commands.exists(command,
+          command.command_function &&
+          command.runs_path_sensitive_check &&
+          !command.changed_file_scope_before_run)
+
+  evidence_maps:
+    - source: ruff
+      codes:
+        - PLC0415
+      policy_id: python.conditional_imports
+      skill_id: conditional-imports
+      principle_ids:
+        - no-conditional-imports
+        - fail-fast-fail-hard-overview
+      confidence: high
+      meaning: >-
+        Import executes away from module scope, usually inside runtime control
+        flow, hiding a required dependency or masking cyclic design pressure.
+      advice:
+        summary: >-
+          Move required imports to module scope. If that exposes a cycle, fix
+          the design instead of hiding the dependency.
+        steps:
+          - Declare the dependency as required.
+          - Import it at module scope.
+          - >-
+            Use SOLID boundaries to split responsibilities when modules depend
+            on each other.
+          - >-
+            In Python, introduce a Protocol in a neutral module when two
+            concrete implementations would otherwise import each other.
+          - >-
+            Replace lazy, conditional, or fallback import paths with explicit
+            startup validation.
+        rerun:
+          - make pre-commit
+          - make check
+    - source: mypy
+      message_substrings:
+        - Cannot resolve import cycle
+        - import cycle
+      policy_id: python.import_cycles
+      skill_id: conditional-imports
+      principle_ids:
+        - protocol-first-design
+        - solid-is-law
+      confidence: medium
+      meaning: >-
+        Concrete modules depend on each other strongly enough that the type
+        checker sees an import cycle.
+      advice:
+        summary: Break the concrete dependency cycle with an explicit interface.
+        steps:
+          - Identify the two modules that import each other.
+          - Move the shared contract into a neutral module.
+          - >-
+            In Python, model that contract with a Protocol when behavior is
+            required.
+          - >-
+            Depend on the Protocol or smaller interface instead of the concrete
+            implementation.
+        rerun:
+          - make pre-commit
+          - make check
+    - source: pyright
+      message_substrings:
+        - Import cycle detected
+        - Import cycles detected
+      policy_id: python.import_cycles
+      skill_id: conditional-imports
+      principle_ids:
+        - protocol-first-design
+        - solid-is-law
+      confidence: medium
+      meaning: >-
+        Concrete modules depend on each other strongly enough that the type
+        checker sees an import cycle.
+      advice:
+        summary: Break the concrete dependency cycle with an explicit interface.
+        steps:
+          - Identify the two modules that import each other.
+          - Move the shared contract into a neutral module.
+          - >-
+            In Python, model that contract with a Protocol when behavior is
+            required.
+          - >-
+            Depend on the Protocol or smaller interface instead of the concrete
+            implementation.
+        rerun:
+          - make pre-commit
+          - make check
+    - source: pylint
+      codes:
+        - cyclic-import
+        - R0401
+      policy_id: python.import_cycles
+      skill_id: conditional-imports
+      principle_ids:
+        - protocol-first-design
+        - solid-is-law
+      confidence: high
+      meaning: Pylint found a concrete module import cycle.
+      advice:
+        summary: Break the concrete dependency cycle with an explicit interface.
+        steps:
+          - Identify the two modules that import each other.
+          - Move the shared contract into a neutral module.
+          - >-
+            In Python, model that contract with a Protocol when behavior is
+            required.
+          - >-
+            Depend on the Protocol or smaller interface instead of the concrete
+            implementation.
+        rerun:
+          - make pre-commit
+          - make check
+    - source: mypy
+      codes:
+        - no-any-return
+      policy_id: python.optional_returns
+      skill_id: lint-remediation
+      principle_ids:
+        - no-optional-types-for-required-dependencies
+        - static-analysis-is-the-first-line-of-defense
+      confidence: medium
+      meaning: A required return path is leaking Any instead of a precise type.
+      advice:
+        summary: Replace Any return flow with an explicit required type.
+        steps:
+          - Identify the source of Any.
+          - Add the missing annotation or typed adapter at the boundary.
+          - Keep required dependencies non-optional.
+        rerun:
+          - make pre-commit
+          - make check
+    - source: shellcheck
+      codes:
+        - SC*
+      policy_id: shell.static_analysis
+      skill_id: lint-remediation
+      principle_ids:
+        - static-analysis-is-the-first-line-of-defense
+        - linting-as-code-quality-enforcement
+      confidence: medium
+      meaning: Shellcheck found shell behavior that is fragile or ambiguous.
+      advice:
+        summary: Fix the shell script structure instead of suppressing ShellCheck.
+        steps:
+          - Quote expansions and make data flow explicit.
+          - Prefer arrays and checked commands over stringly shell assembly.
+          - Keep shell behavior deterministic under strict mode.
+        rerun:
+          - make pre-commit
+    - source: yamllint
+      codes:
+        - indentation
+        - truthy
+      policy_id: yaml.config_clarity
+      skill_id: lint-remediation
+      principle_ids:
+        - validation-at-the-gate
+        - documentation-as-contract
+      confidence: medium
+      meaning: YAML structure or scalar spelling is ambiguous for configuration.
+      advice:
+        summary: Make YAML configuration explicit and parser-stable.
+        steps:
+          - Fix indentation to match the intended structure.
+          - Quote ambiguous scalars when the value is meant to be a string.
+          - Keep configuration readable enough to review in diffs.
+        rerun:
+          - make pre-commit
+    - source: hadolint
+      codes:
+        - DL*
+      policy_id: docker.reproducible_builds
+      skill_id: lint-remediation
+      principle_ids:
+        - security-by-design
+        - evidence-based-engineering-and-decision-quality
+      confidence: medium
+      meaning: >-
+        Dockerfile instructions are weakening reproducibility or container
+        safety.
+      advice:
+        summary: Make the container build deterministic and least-privilege.
+        steps:
+          - Pin package versions where practical.
+          - Avoid broad shell pipelines that hide failures.
+          - Prefer explicit users, trusted sources, and minimal layers.
+        rerun:
+          - make pre-commit
+    - source: actionlint
+      codes:
+        - "*"
+      policy_id: workflow.validation
+      skill_id: lint-remediation
+      principle_ids:
+        - validation-at-the-gate
+        - testing-as-specification
+      confidence: high
+      meaning: GitHub Actions workflow syntax or expression behavior is invalid.
+      advice:
+        summary: Fix workflow definitions before relying on CI as a quality gate.
+        steps:
+          - Validate expressions, job wiring, and event-specific context.
+          - Keep workflow behavior explicit instead of depending on runtime surprises.
+          - Re-run the workflow hook locally before pushing.
+        rerun:
+          - make pre-commit
+    - source: golangci-lint
+      codes:
+        - errcheck
+        - gosec
+        - staticcheck
+        - revive
+      policy_id: go.static_analysis
+      skill_id: lint-remediation
+      principle_ids:
+        - static-analysis-is-the-first-line-of-defense
+        - linting-as-code-quality-enforcement
+      confidence: high
+      meaning: Go static analysis found correctness, security, or maintainability risk.
+      advice:
+        summary: Fix the Go issue structurally and keep golangci-lint blocking.
+        steps:
+          - Handle errors explicitly.
+          - Remove suspicious or insecure constructs instead of suppressing them.
+          - Prefer a small refactor over weakening lint coverage.
+        rerun:
+          - make pre-commit
+          - make check
+    - source: eslint
+      codes:
+        - fatal
+        - no-undef
+        - no-unused-vars
+      policy_id: javascript.static_analysis
+      skill_id: lint-remediation
+      principle_ids:
+        - static-analysis-is-the-first-line-of-defense
+        - linting-as-code-quality-enforcement
+      confidence: medium
+      meaning: >-
+        ESLint found a JavaScript or TypeScript correctness, syntax, or
+        maintainability issue that should be fixed structurally.
+      advice:
+        summary: >-
+          Fix the JavaScript or TypeScript issue without weakening lint coverage.
+        steps:
+          - Resolve syntax and undefined-symbol findings before relying on
+            runtime behavior.
+          - Remove unused code instead of hiding warnings behind broad disables.
+          - Keep ESLint execution routed through the managed coding-ethos wrapper.
+        rerun:
+          - make pre-commit
+    - source: tsc
+      codes:
+        - TS*
+      policy_id: typescript.static_analysis
+      skill_id: lint-remediation
+      principle_ids:
+        - static-analysis-is-the-first-line-of-defense
+        - linting-as-code-quality-enforcement
+      confidence: high
+      meaning: >-
+        TypeScript compiler diagnostics found a type, syntax, or project
+        contract problem that should be fixed before runtime.
+      advice:
+        summary: >-
+          Fix the TypeScript compiler diagnostic through the project type
+          contract.
+        steps:
+          - Keep tsc execution routed through the managed coding-ethos wrapper.
+          - Fix type declarations, imports, and tsconfig boundaries structurally.
+          - Do not bypass type checking with broad any casts or unchecked excludes.
+        rerun:
+          - make pre-commit
+    - source: kube-linter
+      codes:
+        - "*"
+      policy_id: kubernetes.manifest_security
+      skill_id: lint-remediation
+      principle_ids:
+        - static-analysis-is-the-first-line-of-defense
+        - linting-as-code-quality-enforcement
+        - security-by-design
+      confidence: high
+      meaning: >-
+        kube-linter found a Kubernetes manifest safety, least-privilege, or
+        resource-boundary issue that should be fixed before deployment.
+      advice:
+        summary: Fix the Kubernetes manifest finding structurally.
+        steps:
+          - >-
+            Keep kube-linter execution routed through the managed coding-ethos
+            wrapper.
+          - Prefer least-privilege pod security settings and explicit resource limits.
+          - >-
+            Do not silence manifest findings without documenting the
+            operational exception.
+        rerun:
+          - make pre-commit
+    - source: ruff
+      message_substrings:
+        - configuration or usage failed
+        - unexpected argument
+        - No such file or directory
+      policy_id: tool.managed_config
+      skill_id: managed-toolchain
+      principle_ids:
+        - static-analysis-is-the-first-line-of-defense
+        - validation-at-the-gate
+        - one-path-for-critical-operations
+      confidence: high
+      meaning: >-
+        Ruff failed before producing normal diagnostics, usually because the
+        invocation, target paths, managed binary, or generated config drifted
+        away from the coding-ethos runtime contract.
+      advice:
+        summary: Restore the managed coding-ethos toolchain path and rerun Ruff.
+        steps:
+          - Keep the caller's target paths, but execute Ruff through the captured
+            coding-ethos wrapper.
+          - Do not trust consumer-repo Ruff config or host binaries.
+          - Restore generated config drift with make -C coding-ethos fix-configs.
+        rerun:
+          - make pre-commit
+    - source: eslint
+      message_substrings:
+        - configuration or usage failed
+        - Cannot find module
+        - No files matching the pattern
+        - ESLint couldn't find
+      policy_id: tool.managed_config
+      skill_id: managed-toolchain
+      principle_ids:
+        - static-analysis-is-the-first-line-of-defense
+        - validation-at-the-gate
+        - one-path-for-critical-operations
+      confidence: high
+      meaning: >-
+        ESLint failed before producing normal diagnostics, usually because the
+        managed npm package, invocation, target paths, or config boundary drifted
+        away from the coding-ethos runtime contract.
+      advice:
+        summary: >-
+          Restore managed ESLint execution before interpreting JavaScript findings.
+        steps:
+          - Run ESLint through the coding-ethos capture wrapper.
+          - Do not fall back to host-global ESLint or unmanaged npm scripts.
+          - Rebuild the managed toolchain if the ESLint package or wrapper is missing.
+        rerun:
+          - make build
+          - make pre-commit
+    - source: tsc
+      message_substrings:
+        - configuration or usage failed
+        - Cannot find
+        - The specified path does not exist
+      policy_id: tool.managed_config
+      skill_id: managed-toolchain
+      principle_ids:
+        - static-analysis-is-the-first-line-of-defense
+        - validation-at-the-gate
+        - one-path-for-critical-operations
+      confidence: high
+      meaning: >-
+        tsc failed before producing normal project diagnostics, usually because
+        the managed npm package, invocation, or tsconfig boundary drifted away
+        from the coding-ethos runtime contract.
+      advice:
+        summary: >-
+          Restore managed tsc execution before interpreting TypeScript findings.
+        steps:
+          - Run tsc through the coding-ethos capture wrapper.
+          - Keep the project boundary explicit with tsconfig.json.
+          - >-
+            Rebuild the managed toolchain if the TypeScript package or wrapper
+            is missing.
+        rerun:
+          - make build
+          - make pre-commit
+    - source: kube-linter
+      message_substrings:
+        - configuration or usage failed
+        - failed to load config
+        - failed to parse
+        - no valid objects found
+      policy_id: tool.managed_config
+      skill_id: managed-toolchain
+      principle_ids:
+        - static-analysis-is-the-first-line-of-defense
+        - validation-at-the-gate
+        - one-path-for-critical-operations
+      confidence: high
+      meaning: >-
+        kube-linter failed before producing normal manifest diagnostics,
+        usually because the managed Go binary, invocation, or Kubernetes
+        manifest boundary drifted away from the coding-ethos runtime contract.
+      advice:
+        summary: >-
+          Restore managed kube-linter execution before interpreting manifest
+          findings.
+        steps:
+          - Run kube-linter through the coding-ethos capture wrapper.
+          - >-
+            Pass explicit Kubernetes manifest paths rather than relying on host
+            discovery.
+          - Rebuild the managed toolchain if the kube-linter binary is missing.
+        rerun:
+          - make build
+          - make pre-commit
+    - source: mypy
+      message_substrings:
+        - configuration or usage failed
+        - cannot read file
+        - No such file or directory
+      policy_id: tool.managed_config
+      skill_id: managed-toolchain
+      principle_ids:
+        - static-analysis-is-the-first-line-of-defense
+        - validation-at-the-gate
+        - one-path-for-critical-operations
+      confidence: high
+      meaning: >-
+        Mypy failed before producing normal diagnostics, usually because target
+        resolution, generated config, or managed execution context is wrong.
+      advice:
+        summary: Run mypy through the managed coding-ethos wrapper and config.
+        steps:
+          - Resolve target files relative to the caller as requested.
+          - Execute mypy from the coding-ethos managed environment and config.
+          - Restore generated config drift before trusting type-check output.
+        rerun:
+          - make pre-commit
+          - make check
+    - source: pyright
+      message_substrings:
+        - configuration or usage failed
+        - File or directory
+        - No such file or directory
+      policy_id: tool.managed_config
+      skill_id: managed-toolchain
+      principle_ids:
+        - static-analysis-is-the-first-line-of-defense
+        - validation-at-the-gate
+        - one-path-for-critical-operations
+      confidence: high
+      meaning: >-
+        Pyright failed before producing normal diagnostics, usually because the
+        managed project/config boundary or target resolution is wrong.
+      advice:
+        summary: Restore managed Pyright execution before interpreting results.
+        steps:
+          - Keep caller target intent but normalize paths through coding-ethos.
+          - Use the generated pyrightconfig from the coding-ethos checkout.
+          - Treat drifted generated configs as blocking infrastructure failures.
+        rerun:
+          - make pre-commit
+          - make check
+    - source: pylint
+      message_substrings:
+        - configuration or usage failed
+        - No such file or directory
+      policy_id: tool.managed_config
+      skill_id: managed-toolchain
+      principle_ids:
+        - static-analysis-is-the-first-line-of-defense
+        - validation-at-the-gate
+        - one-path-for-critical-operations
+      confidence: high
+      meaning: >-
+        Pylint failed before producing normal diagnostics, usually because
+        managed execution or generated config is not being used.
+      advice:
+        summary: Restore managed Pylint execution and generated config first.
+        steps:
+          - Run Pylint through the coding-ethos capture wrapper.
+          - Do not fall back to host or consumer-repo Pylint settings.
+          - Rebuild or restore generated configs before rerunning.
+        rerun:
+          - make pre-commit
+
+git:
+  staged_admin_files:
+    basenames:
+      - .pre-commit-config.yaml
+      - pre-commit-config.yaml
+      - .importlinter
+      - importlinter
+      - .pylintrc
+      - pylintrc
+      - pyproject.toml
+    dirs:
+      - .pre-commit
+      - pre-commit
+
+filesystem:
+  protected_path:
+    enabled: true
+    paths:
+      - .bandit.yml
+      - .pylintrc
+      - .sqlfluff
+      - .yamllint.yml
+      - coding-ethos-hooks/coding-ethos-git-hook
+      - coding-ethos-hooks/bin/coding-ethos-agent-hooks
+      - coding-ethos-hooks/bin/coding-ethos-git
+      - coding-ethos-hooks/bin/coding-ethos-git-hook
+      - coding-ethos-hooks/bin/coding-ethos-hook
+      - coding-ethos-hooks/bin/coding-ethos-lint
+      - coding-ethos-hooks/bin/coding-ethos-policy
+      - coding-ethos-hooks/lefthook
+      - mypy.ini
+      - pyrightconfig.json
+      - ruff.toml
+      - tombi.toml
+  protected_branch_write:
+    branches:
+      - main
+      - master
+    exempt_path_prefixes:
+      - .claude/
+      - docs/plans/
+  required_ignores:
+    enabled: true
+    paths:
+      - .claude/settings.local.json
+      - .coding-ethos/cache/
+      - .coding-ethos/code-intel.duckdb
+      - .coding-ethos/code-intel.duckdb.wal
+      - .coding-ethos/events/
+      - .coding-ethos/hook-runs/
+      - .coding-ethos/lint-runs/
+      - .coding-ethos/prune-runs/
+      - .coding-ethos/state/
+      - .gemini/settings.json
+      - .mcp.json
+  pii_scrubber:
+    enabled: true
+    patterns:
+      - '/(home|Users)/[A-Za-z0-9._-]+/'
+      - 'lbox-worktrees/[A-Za-z0-9._-]+'
+      - '/tmp/tmp\.[A-Za-z0-9._-]+'
+    literals: []
+    allowed_patterns:
+      - '/home/agent/'
+    exempt_prefixes:
+      - .git/
+  license_header:
+    enabled: true
+    extensions:
+      - .go
+      - .py
+      - .sh
+    exempt_prefixes:
+      - .git/
+    exempt_basenames: []
+    required:
+      - 'SPDX-FileCopyrightText:'
+      - 'SPDX-License-Identifier:'
+    scan_lines: 5
+  shebangs:
+    enabled: true
+  large_files:
+    enabled: false
+  line_limits:
+    enabled: false
+
+shell:
+  dangerous_command:
+    enabled: true
+  background_git:
+    enabled: true
+  github_admin:
+    enabled: true
+  best_practices:
+    enabled: true
+    require_common_for_prefixes:
+      - scripts/
+  forbidden_strings:
+    enabled: true
+    exempt_paths:
+      - config.yaml
+      - coding_ethos.yml
+      - go/internal/policy/**
+      - go/internal/redteam/**
+      - go/scripts/smoke_hook_edges.sh
+    file_strings:
+      - PLC0415
+    strings:
+      - /.claude/settings.json
+      - /.claude/settings.local.json
+      - ~/.claude/settings.json
+      - ~/.claude/settings.local.json
+      - /.codex/config.toml
+      - /.codex/hooks.json
+      - /.gemini/settings.json
+      - coding-ethos-hooks/coding-ethos-git-hook
+      - coding-ethos-hooks/bin/coding-ethos-agent-hooks
+      - coding-ethos-hooks/bin/coding-ethos-git
+      - coding-ethos-hooks/bin/coding-ethos-git-hook
+      - coding-ethos-hooks/bin/coding-ethos-hook
+      - coding-ethos-hooks/bin/coding-ethos-lint
+      - coding-ethos-hooks/bin/coding-ethos-policy
+      - coding-ethos-hooks/lefthook
+      - /coding-ethos/pre-commit/hooks/
+      - /coding-ethos/config.yaml
+      - /coding-ethos/ruff.toml
+      - /coding-ethos/.golangci.yml
+      - header must match
+
+security:
+  private_key:
+    enabled: true
+    pattern: '-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----'
+
+agent_advice:
+  reminders:
+    ambient_frequency_percent: 25
+
+python:
+  source_paths:
+    - coding_ethos
+    - pre-commit/hooks
+  test_paths:
+    - tests
+  stub_paths: []
+  extra_paths:
+    - .
+    - pre-commit/hooks
+  venv_path: .
+  venv: .venv
+
+  comment_suppressions:
+    enabled: true
+    patterns:
+      - regex: '#\s*ruff:\s*noqa\b'
+        label: 'ruff: noqa (file-level)'
+      - regex: '#\s*mypy:\s*ignore-errors\b'
+        label: 'mypy: ignore-errors (file-level)'
+      - regex: '#\s*noqa\b'
+        label: 'noqa'
+      - regex: '#\s*type:\s*ignore\b'
+        label: 'type: ignore'
+      - regex: '#\s*pragma:\s*no\s*cover\b'
+        label: 'pragma: no cover'
+      - regex: '#\s*pylint:\s*disable'
+        label: 'pylint: disable'
+      - regex: '#\s*noinspection\b'
+        label: 'noinspection'
+      - regex: '#\s*fmt:\s*(off|on|skip)\b'
+        label: 'fmt: off/on/skip'
+      - regex: '#\s*isort:\s*(skip|skip_file)\b'
+        label: 'isort: skip'
+      - regex: '#\s*pyright:\s*ignore\b'
+        label: 'pyright: ignore'
+
+  module_docs:
+    enabled: true
+    source_docs_path: docs/SOURCE_DOCS.md
+    check_filenames:
+      - __init__.py
+      - conftest.py
+    excluded_dirs:
+      - .venv
+      - .lint-cache
+      - .mypy_cache
+      - .ruff_cache
+      - __pycache__
+      - node_modules
+      - .git
+    banned_doc_filenames:
+      - README.md
+      - readme.md
+
+  direct_imports:
+    enabled: true
+    packages:
+      - coding_ethos
+
+  util_centralization:
+    enabled: false
+    banned_modules: []
+
+  structured_logging:
+    enabled: true
+    methods:
+      - debug
+      - info
+      - warning
+      - error
+      - critical
+    logger_names:
+      - logger
+      - _logger
+      - log
+      - _log
+    exempt_kwargs:
+      - exc_info
+      - stack_info
+      - stacklevel
+
+  conditional_imports:
+    enabled: true
+    exception_names:
+      - ImportError
+      - ModuleNotFoundError
+    capability_prefix: HAS_
+
+  functional_idioms:
+    enabled: true
+
+  type_checking_imports:
+    enabled: true
+    type_checking_names:
+      - TYPE_CHECKING
+    future_import_name: annotations
+
+  catch_and_silence:
+    enabled: true
+
+  optional_returns:
+    enabled: true
+    exempt_method_names:
+      - __exit__
+      - __aexit__
+
+  security_patterns:
+    enabled: true
+    sql_keywords:
+      - SELECT
+      - INSERT
+      - UPDATE
+      - DELETE
+      - DROP
+      - CREATE
+      - ALTER
+      - TRUNCATE
+      - EXECUTE
+      - EXEC
+    secret_patterns:
+      - sk-
+      - pk-
+      - api_
+      - key_
+      - token_
+      - secret_
+      - password
+      - passwd
+      - credential
+    test_file_markers:
+      - tests
+      - conftest
+      - test_
+      - _test.py
+    min_getenv_args_with_default: 2
+
+  sql_centralization:
+    enabled: false
+    module_name: project.sql
+    central_paths: []
+    exempt_paths:
+      - tests
+    migration_markers:
+      - alembic
+      - migrations
+    min_string_length: 15
+    error_context_keywords:
+      - suggestion
+      - reason
+      - message
+      - match
+      - extra
+
+  manifest_validation:
+    enabled: false
+    candidate_paths:
+      - manifest.yaml
+      - coding-ethos/manifest.yaml
+    required_string_fields:
+      - version
+    required_list_sections:
+      symlinks:
+        required: true
+        required_string_fields:
+          - source
+          - target
+      repositories:
+        required: false
+        required_string_fields:
+          - name
+          - url
+        optional_string_fields:
+          - branch
+
+  plan_completion:
+    enabled: false
+    metadata_filename: metadata.yaml
+    root_markers:
+      - docs/plans/
+    completed_status_values:
+      - review
+      - complete
+
+  pytest_gate:
+    enabled: true
+    banned_markers:
+      - skip
+      - skipif
+    test_command:
+      - uv
+      - run
+      - --frozen
+      - pytest
+      - tests
+      - --strict-markers
+
+  file_docstrings:
+    enabled: true
+    min_sentences: 3
+    exempt_filenames:
+      - __init__.py
+      - conftest.py
+
+  docstring_coverage:
+    enabled: true
+    threshold: 90
+    command:
+      - coding-ethos-docstring-coverage
+    use_hook_project: true
+    verbose: true
+    ignore_init_method: true
+    ignore_init_module: true
+    ignore_magic: true
+    ignore_private: true
+    ignore_semiprivate: true
+    ignore_property_decorators: true
+    ignore_nested_functions: true
+    ignore_nested_classes: true
+    check_paths:
+      - coding_ethos
+      - pre-commit/hooks
+    exclude_patterns:
+      - __pycache__
+      - \.venv
+      - tests
+      - .*_test\.py$
+      - test_.*\.py$
+
+  version_consistency:
+    enabled: true
+
+  pyproject_ignores:
+    enabled: true
+    allowed_ignore_patterns:
+      - tests/**
+      - tests/*
+      - '**/tests/**'
+      - '**/tests/*'
+      - test_*.py
+      - '*_test.py'
+      - stubs/**
+      - stubs/*
+      - '**/stubs/**'
+      - '**/stubs/*'
+    allowed_exclude_patterns:
+      - .git
+      - .venv
+      - .mypy_cache
+      - .ruff_cache
+      - __pycache__
+      - '*.egg-info'
+      - .eggs
+      - build
+      - dist
+      - node_modules
+    allowed_mypy_missing_imports: []
+
+  uv_exclude_newer:
+    enabled: true
+    expected_value: 7 days
+
+  type_check:
+    enabled: true
+    excluded_path_fragments:
+      - /docker/
+      - vulture_whitelist
+    checkers:
+      - name: ruff
+        enabled: true
+        command:
+          - ruff
+          - check
+          - --quiet
+          - --ignore-noqa
+          - --output-format
+          - json
+        pass_files_as_args: true
+        use_hook_project: true
+        config_flags:
+          - --config
+        repo_config: ruff.toml
+      - name: pyright
+        enabled: true
+        command:
+          - pyright
+          - --outputjson
+        pass_files_as_args: true
+        use_hook_project: true
+        config_flags:
+          - --project
+          - -p
+        repo_config: pyrightconfig.json
+        fallback_bundle_config: hooks/pyproject.toml
+      - name: mypy
+        enabled: true
+        command:
+          - mypy
+          - --output
+          - json
+        pass_files_as_args: true
+        use_hook_project: true
+        config_flags:
+          - --config-file
+        repo_config: mypy.ini
+        fallback_bundle_config: hooks/pyproject.toml
+      - name: pylint
+        enabled: false
+        command:
+          - pylint
+          - --output-format=json
+        pass_files_as_args: true
+        use_hook_project: true
+        config_flags:
+          - --rcfile
+        repo_config: .pylintrc
+
+tooling:
+  pyright:
+    enabled: true
+    type_checking_mode: strict
+    include: []
+    exclude:
+      - "**/tests/**"
+      - "**/*_test.py"
+      - "**/test_*.py"
+      - "**/.venv/**"
+    extra_paths: []
+    venv_path: ""
+    venv: ""
+    stub_path: ""
+
+  mypy:
+    enabled: true
+    strict: true
+    warn_unused_configs: true
+    plugins:
+      - pydantic.mypy
+    files: []
+    mypy_path: ""
+    exclude_patterns:
+      - (^|/)tests/
+      - (^|/).*_test\.py$
+      - (^|/)test_.*\.py$
+      - (^|/)\.venv/
+
+  ruff:
+    enabled: true
+    target_version: py313
+    select:
+      - ALL
+    ignore:
+      - COM812
+      - ISC001
+      - D203
+      - D213
+      - S603
+      - S607
+      - T201
+      - TC
+      - TC001
+      - TC002
+      - TC003
+      - TC004
+    exclude:
+      - .git
+      - .venv
+      - .mypy_cache
+      - .ruff_cache
+      - __pycache__
+      - tests
+      - "**/tests/**"
+      - "**/*_test.py"
+      - "**/test_*.py"
+      - '*.egg-info'
+      - .eggs
+      - build
+      - dist
+      - node_modules
+    max_args: 6
+    stub_per_file_ignores:
+      - A001
+      - A002
+      - ANN401
+      - D
+      - FBT001
+      - FBT002
+      - N801
+      - N803
+      - PYI020
+      - RUF100
+      - TC
+      - UP037
+    test_per_file_ignores:
+      - ANN401
+      - ARG001
+      - ARG002
+      - B017
+      - D
+      - E501
+      - EM101
+      - EM102
+      - PERF401
+      - PLR0913
+      - PLR2004
+      - PT011
+      - PT012
+      - RUF012
+      - S101
+      - S105
+      - S106
+      - SIM117
+      - SLF001
+      - TC003
+      - TRY003
+    sql_per_file_ignores:
+      - S608
+    extra_per_file_ignores: {}
+    banned_api:
+      dateutil.tz: Use `zoneinfo` instead.
+      importlib: banned, use standard imports
+
+  pylint:
+    enabled: true
+    jobs: 0
+    persistent: false
+    reports: false
+    score: false
+    ignore:
+      - .git
+      - .venv
+      - .mypy_cache
+      - .ruff_cache
+      - __pycache__
+      - build
+      - dist
+      - node_modules
+    ignore_paths:
+      - (^|/)\.git/
+      - (^|/)\.venv/
+      - (^|/)__pycache__/
+      - (^|/)\.mypy_cache/
+      - (^|/)\.ruff_cache/
+      - (^|/)build/
+      - (^|/)dist/
+      - (^|/)node_modules/
+      - (^|/)tests/
+      - (^|/).*_test\.py$
+      - (^|/)test_.*\.py$
+    disable:
+      - missing-module-docstring
+      - missing-class-docstring
+      - missing-function-docstring
+      - line-too-long
+      - too-few-public-methods
+      - duplicate-code
+      - import-error
+      - no-member
+      - too-many-instance-attributes
+      - too-many-locals
+      - too-many-branches
+      - too-many-statements
+      - fixme
+    good_names:
+      - i
+      - j
+      - k
+      - ex
+      - _
+    max_args: 6
+
+  yamllint:
+    enabled: true
+    extends: default
+    rules:
+      comments: disable
+      comments-indentation: disable
+      document-start: disable
+      line-length:
+        allow-non-breakable-inline-mappings: true
+        allow-non-breakable-words: true
+      truthy:
+        allowed-values:
+          - "true"
+          - "false"
+        check-keys: false
+
+  bandit:
+    enabled: true
+    exclude_dirs:
+      - tests
+      - .venv
+      - build
+      - dist
+      - node_modules
+    skips: []
+
+  sqlfluff:
+    enabled: true
+    dialect: ansi
+    templater: raw
+    rules: []
+    exclude_rules: []
+
+  tombi:
+    enabled: true
+    schema:
+      enabled: false
+
+  golangci_lint:
+    version: "2"
+    run:
+      tests: true
+    formatters:
+      enable:
+        - gci
+        - gofmt
+        - gofumpt
+        - goimports
+        - golines
+      exclusions:
+        generated: strict
+        warn-unused: true
+      settings:
+        gci:
+          sections:
+            - standard
+            - default
+            - prefix(github.com/ethosure/coding_ethos/go)
+            - localmodule
+          custom-order: true
+        gofmt:
+          simplify: true
+        gofumpt:
+          module-path: github.com/ethosure/coding_ethos/go
+          extra-rules: true
+        goimports:
+          local-prefixes:
+            - github.com/ethosure/coding_ethos/go
+        golines:
+          max-len: 88
+          tab-len: 1
+    issues:
+      max-issues-per-linter: 0
+      max-same-issues: 0
+    linters:
+      default: standard
+      enable:
+        - asasalint
+        - asciicheck
+        - bidichk
+        - bodyclose
+        - canonicalheader
+        - containedctx
+        - contextcheck
+        - copyloopvar
+        - cyclop
+        - decorder
+        - depguard
+        - dogsled
+        - dupl
+        - dupword
+        - durationcheck
+        - embeddedstructfieldcheck
+        - err113
+        - errcheck
+        - errchkjson
+        - errname
+        - errorlint
+        - exhaustive
+        - exptostd
+        - fatcontext
+        - forbidigo
+        - forcetypeassert
+        - funcorder
+        - funlen
+        - gocheckcompilerdirectives
+        - gochecknoglobals
+        - gochecknoinits
+        - gochecksumtype
+        - gocognit
+        - goconst
+        - gocritic
+        - gocyclo
+        - godoclint
+        - godot
+        - godox
+        - gomoddirectives
+        - gomodguard
+        - goprintffuncname
+        - govet
+        - grouper
+        - iface
+        - importas
+        - inamedparam
+        - interfacebloat
+        - intrange
+        - iotamixing
+        - lll
+        - loggercheck
+        - maintidx
+        - makezero
+        - mirror
+        - mnd
+        - modernize
+        - musttag
+        - nakedret
+        - nestif
+        - nilerr
+        - nilnesserr
+        - nilnil
+        - nlreturn
+        - noctx
+        - noinlineerr
+        - nolintlint
+        - nonamedreturns
+        - nosprintfhostport
+        - paralleltest
+        - perfsprint
+        - prealloc
+        - predeclared
+        - promlinter
+        - protogetter
+        - reassign
+        - recvcheck
+        - revive
+        - rowserrcheck
+        - sloglint
+        - spancheck
+        - sqlclosecheck
+        - staticcheck
+        - tagalign
+        - tagliatelle
+        - testableexamples
+        - testpackage
+        - testifylint
+        - thelper
+        - tparallel
+        - unconvert
+        - unparam
+        - unqueryvet
+        - unused
+        - usestdlibvars
+        - usetesting
+        - varnamelen
+        - wastedassign
+        - whitespace
+        - wrapcheck
+        - wsl_v5
+        - zerologlint
+      exclusions:
+        generated: strict
+        paths:
+          - ".*_test\\.go"
+        warn-unused: true
+        presets:
+          - comments
+          - common-false-positives
+          - legacy
+          - std-error-handling
+      settings:
+        cyclop:
+          max-complexity: 12
+        depguard:
+          rules:
+            main:
+              deny:
+                - pkg: github.com/pkg/errors
+                  desc: Use standard errors plus fmt.Errorf("%w") wrapping.
+                - pkg: io/ioutil
+                  desc: Use os or io package replacements.
+        errcheck:
+          check-blank: true
+          check-type-assertions: true
+        funlen:
+          lines: 80
+          statements: 60
+        gocognit:
+          min-complexity: 20
+        gocyclo:
+          min-complexity: 12
+        gosec:
+          excludes:
+            - G101
+            - G304
+        govet:
+          enable-all: true
+        gomoddirectives:
+          replace-allow-list: []
+          retract-allow-no-explanation: false
+          exclude-forbidden: false
+        lll:
+          tab-width: 1
+        nestif:
+          min-complexity: 4
+        revive:
+          severity: error
+        tagliatelle:
+          case:
+            rules:
+              json: snake
+              yaml: snake
+        testifylint:
+          enable-all: true
+
+go:
+  enabled: false
+  worktree: go
+  commitlint:
+    enabled: true
+    allowed_types:
+      - chore
+      - docs
+      - feat
+      - fix
+      - perf
+      - refactor
+      - test
+    ignored_prefixes:
+      - 'Merge '
+      - 'Revert '
+      - 'fixup! '
+      - 'squash! '
+    max_header_length: 150
+  commit_attribution:
+    enabled: true
+    blocked_names:
+      - claude
+      - anthropic
+      - gpt
+      - chatgpt
+      - openai
+      - copilot
+      - github copilot
+      - ai assistant
+      - ai agent
+      - llm
+      - large language model
+      - gemini
+      - bard
+      - cursor
+  text:
+    forbidden_strings:
+      - PLC0415
+    large_file_exclude_prefixes: []
+    large_file_suffixes:
+      - .bash
+      - .json
+      - .sh
+      - .toml
+      - .yaml
+      - .yml
+    max_large_file_kb: 500
+  line_limits:
+    python_hard: 1000
+    python_warn: 800
+    shell_hard: 500
+    shell_warn: 400
+  shell:
+    require_common_for_prefixes:
+      - scripts/
+  quiet_filter:
+    ansi_regex: \x1b\[[0-9;]*m
+    passed_regex: \.{3,}Passed$
+    skipped_regex: (\.{3,}Skipped$|\(no files to check\)Skipped$)
+    failed_regex: \.{3,}Failed$
+    status_regex: \.{3,}(Failed|Passed|Skipped)$
+    preexisting_regex: ^\s*\[Pre-existing \([0-9]+\)\]$
+    separator_regex: ^={50,}$
+    banner_width: 70
+    metadata_prefixes:
+      - '- hook id:'
+      - '- duration:'
+      - '- files were modified'
+    suppress_exact:
+      - All checks passed!
+      - Analyzing diff for changed lines...
+    suppress_prefixes:
+      - '- files were modified'
+      - Both GOOGLE_API_KEY and GEMINI_API_KEY
+      - '[WARNING] Unstaged'
+      - '  Failed to get diff for'
+    suppress_regexes:
+      - '^[0-9]+ files? already formatted$'
+      - '^[0-9].*files? already formatted$'
+      - '^\[INFO\] (Stashing|Restored)'
+      - '^  (Rate limited|Timeout|Service unavailable|Error), waiting'
+      - '^  Skipping .* \(>[0-9]+KB\)'
+      - '^Running [0-9]+ check types in parallel'
+      - '^OK .*: PASS \([0-9]+ms\)$'
+      - '^Summary: [0-9]+ passed'
+      - '^Total time: [0-9]+ms'
+      - '^\[.*\] Processing [0-9]+ files'
+      - '^\[.*\] Batch error:'

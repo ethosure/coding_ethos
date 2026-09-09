@@ -1,0 +1,324 @@
+// SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package codeintelcli
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+
+	"github.com/ethosure/coding_ethos/go/internal/apperror"
+	"github.com/ethosure/coding_ethos/go/internal/codeintel"
+	"github.com/ethosure/coding_ethos/go/internal/feedback"
+)
+
+var errUnsupportedGraphReportFormat = apperror.StaticError(
+	"unsupported graph-report format",
+)
+
+func printGraphReport(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("graph-report", flag.ExitOnError)
+	storeFlags := addStoreFlags(flags, "Repository root containing .coding-ethos")
+	path := flags.String("path", "", "Filter by source path or directory")
+	format := flags.String(
+		"format",
+		feedback.FormatHuman,
+		"Output format: human, json, or toon",
+	)
+	limit := addResultLimit(flags)
+	symbolsPerFile := flags.Int(
+		"symbols-per-file",
+		defaultGraphReportSymbols,
+		"Maximum symbols to show for each ranked file",
+	)
+
+	err := parseCommandFlags(flags, args, "graph-report")
+	if err != nil {
+		return err
+	}
+
+	store, err := openStore(ctx, *storeFlags.root, *storeFlags.dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+
+	report, err := store.GraphReport(ctx, codeintel.GraphReportQuery{
+		Root:           *storeFlags.root,
+		Path:           *path,
+		Limit:          *limit,
+		SymbolsPerFile: *symbolsPerFile,
+	})
+	if err != nil {
+		return fmt.Errorf("query graph report: %w", err)
+	}
+
+	message := graphReportFeedback(report)
+
+	formatVal := strings.TrimSpace(*format)
+	if formatVal == "" {
+		formatVal = feedback.FormatHuman
+	}
+
+	switch formatVal {
+	case feedback.FormatHuman, feedback.FormatTOON:
+		err = feedback.Write(
+			os.Stdout,
+			message,
+			formatVal,
+		)
+		if err != nil {
+			return fmt.Errorf("write graph report %s output: %w", formatVal, err)
+		}
+
+		return nil
+	case outputFormatJSON:
+		err = encodeJSON(os.Stdout, report)
+		if err != nil {
+			return fmt.Errorf("write graph report JSON: %w", err)
+		}
+
+		return nil
+	default:
+		return fmt.Errorf("%w: %q", errUnsupportedGraphReportFormat, *format)
+	}
+}
+
+func graphReportFeedback(report codeintel.GraphReport) feedback.Message {
+	return feedback.Message{
+		Scalars: []feedback.Scalar{
+			feedback.S("kind", report.Kind),
+			feedback.S("root", report.Root),
+			feedback.S("path", report.Path),
+			feedback.S("files", strconv.Itoa(report.Stats.Files)),
+			feedback.S("code_chunks", strconv.Itoa(report.Stats.CodeChunks)),
+			feedback.S("code_edges", strconv.Itoa(report.Stats.CodeEdges)),
+			feedback.S("findings", strconv.Itoa(report.Stats.Findings)),
+			feedback.S("remediations", strconv.Itoa(report.Stats.Remediations)),
+			feedback.S(
+				"code_health_targets",
+				strconv.Itoa(report.Stats.CodeHealthTargets),
+			),
+		},
+		Tables: graphReportTables(report),
+	}
+}
+
+func graphReportTables(report codeintel.GraphReport) []feedback.Table {
+	tables := []feedback.Table{}
+	if len(report.CentralFiles) > 0 {
+		tables = append(tables, graphReportCentralFilesTable(report.CentralFiles))
+	}
+
+	if len(report.CentralNodes) > 0 {
+		tables = append(tables, centralNodesTable(report.CentralNodes))
+	}
+
+	if len(report.Communities) > 0 {
+		tables = append(tables, graphReportCommunitiesTable(report.Communities))
+	}
+
+	if len(report.DocumentLinks) > 0 {
+		tables = append(tables, graphReportDocumentLinksTable(report.DocumentLinks))
+	}
+
+	if len(report.SurpriseEdges) > 0 {
+		tables = append(tables, surpriseEdgesTable(report.SurpriseEdges))
+	}
+
+	if len(report.HealthTargets) > 0 {
+		tables = append(tables, graphReportHealthTargetsTable(report.HealthTargets))
+	}
+
+	if len(report.Warnings) > 0 {
+		tables = append(tables, graphReportListTable("warnings", report.Warnings))
+	}
+
+	if len(report.SuggestedActions) > 0 {
+		tables = append(
+			tables,
+			graphReportListTable("suggested_actions", report.SuggestedActions),
+		)
+	}
+
+	return tables
+}
+
+func graphReportCentralFilesTable(
+	files []codeintel.GraphReportFile,
+) feedback.Table {
+	rows := make([][]string, 0, len(files))
+	for _, file := range files {
+		rows = append(rows, []string{
+			file.Path,
+			file.Language,
+			strconv.Itoa(file.LineCount),
+			strconv.Itoa(file.Score),
+			strconv.FormatFloat(file.HotspotScore, 'f', 1, 64),
+			strconv.Itoa(file.HiddenCouplingCount),
+			strconv.Itoa(file.SymbolCount),
+			strconv.Itoa(file.ChunkCount),
+			strings.Join(file.ProvenanceClasses, "|"),
+			strings.Join(file.Reasons, "; "),
+		})
+	}
+
+	return feedback.Table{
+		Name: "central_files",
+		Columns: []string{
+			"path",
+			"language",
+			"lines",
+			"score",
+			"hotspot",
+			"hidden_couplings",
+			"symbols",
+			"chunks",
+			"provenance",
+			"reasons",
+		},
+		Rows: rows,
+	}
+}
+
+func graphReportCommunitiesTable(
+	communities []codeintel.CodeCommunity,
+) feedback.Table {
+	rows := make([][]string, 0, len(communities))
+	for _, community := range communities {
+		rows = append(rows, []string{
+			community.ID,
+			strconv.Itoa(community.MemberCount),
+			strconv.Itoa(community.Score),
+			strings.Join(community.RepresentativePaths, "; "),
+			graphReportCommunityMembers(community.CentralMembers),
+			strings.Join(community.ProvenanceClasses, "|"),
+			graphReportCommunityEvidence(community.Evidence),
+		})
+	}
+
+	return feedback.Table{
+		Name: "communities",
+		Columns: []string{
+			"id",
+			"members",
+			"score",
+			"representatives",
+			"central_members",
+			"provenance",
+			"evidence",
+		},
+		Rows: rows,
+	}
+}
+
+func graphReportDocumentLinksTable(
+	links []codeintel.DocumentLink,
+) feedback.Table {
+	rows := make([][]string, 0, len(links))
+	for _, link := range links {
+		rows = append(rows, []string{
+			link.Kind,
+			link.SourcePath,
+			link.SourceHeading,
+			strconv.Itoa(link.StartLine),
+			link.TargetPath,
+			link.TargetSymbolPath,
+			link.TargetName,
+			link.ProvenanceClass,
+			link.Evidence,
+		})
+	}
+
+	return feedback.Table{
+		Name: "document_links",
+		Columns: []string{
+			"kind",
+			"source_path",
+			"source_heading",
+			"line",
+			"target_path",
+			"target_symbol",
+			"target_name",
+			"provenance",
+			"evidence",
+		},
+		Rows: rows,
+	}
+}
+
+func graphReportHealthTargetsTable(
+	targets []codeintel.CodeHealthTarget,
+) feedback.Table {
+	rows := make([][]string, 0, len(targets))
+	for _, target := range targets {
+		rows = append(rows, []string{
+			strconv.Itoa(target.Rank),
+			target.Path,
+			strconv.FormatFloat(target.PriorityScore, 'f', 1, 64),
+			strconv.FormatFloat(target.HealthScore, 'f', 1, 64),
+			graphReportPrimaryEvidence(target),
+		})
+	}
+
+	return feedback.Table{
+		Name:    "health_targets",
+		Columns: []string{"rank", "path", "priority", "health", "evidence"},
+		Rows:    rows,
+	}
+}
+
+func graphReportListTable(name string, values []string) feedback.Table {
+	rows := make([][]string, 0, len(values))
+	for _, value := range values {
+		rows = append(rows, []string{value})
+	}
+
+	return feedback.Table{
+		Name:    name,
+		Columns: []string{"message"},
+		Rows:    rows,
+	}
+}
+
+func graphReportCommunityMembers(members []codeintel.CodeCommunityMember) string {
+	parts := make([]string, 0, len(members))
+	for _, member := range members {
+		parts = append(parts, fmt.Sprintf(
+			"%s(score=%d,degree=%d)",
+			member.Path,
+			member.Score,
+			member.WeightedDegree,
+		))
+	}
+
+	return strings.Join(parts, "; ")
+}
+
+func graphReportCommunityEvidence(evidence []codeintel.CodeCommunityEvidence) string {
+	parts := make([]string, 0, len(evidence))
+	for _, item := range evidence {
+		parts = append(parts, fmt.Sprintf(
+			"%s:%s->%s(weight=%d,provenance=%s)",
+			item.Kind,
+			item.SourcePath,
+			item.TargetPath,
+			item.Weight,
+			item.ProvenanceClass,
+		))
+	}
+
+	return strings.Join(parts, "; ")
+}
+
+func graphReportPrimaryEvidence(target codeintel.CodeHealthTarget) string {
+	if len(target.Evidence) == 0 {
+		return ""
+	}
+
+	return target.Evidence[0].Message
+}

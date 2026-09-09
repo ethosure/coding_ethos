@@ -1,0 +1,242 @@
+<!-- SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com> -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+
+# Release Process
+
+This document describes the public release path for `coding-ethos`.
+
+## Versioning
+
+`coding-ethos` follows semantic versioning:
+
+- Patch releases fix bugs, docs, CI, or packaging without changing supported
+  behavior.
+- Minor releases add features or new policy surfaces in a backward-compatible
+  way.
+- Major releases may change generated config contracts, hook behavior, or
+  policy bundle compatibility.
+
+Release version metadata must stay aligned across the root Python package,
+runtime import metadata, bundled hook package, and editable lock metadata:
+`pyproject.toml`, `coding_ethos/__init__.py`,
+`pre-commit/hooks/pyproject.toml`,
+`pre-commit/hooks/coding_ethos_hooks/__init__.py`, `uv.lock`, and
+`pre-commit/hooks/uv.lock`.
+
+## Support And Upgrade Policy
+
+`coding-ethos` provides an upgrade path to newer supported releases rather
+than maintaining long-lived older release branches. Patch releases preserve
+supported behavior and should be safe upgrades within the same minor release.
+Minor releases may add new policy surfaces, MCP tools, generated configs, or CI
+features, but should remain backward-compatible unless the release notes call
+out a migration step. Major releases may change generated config contracts,
+hook behavior, or policy bundle compatibility.
+
+Each release note entry must describe the supported upgrade path and any
+migration notes for consumer repositories. If a release changes hooks, MCP
+tools, CEL inputs, SARIF behavior, generated config, package layout, or runtime
+bootstrap behavior, the release notes must include the changed interface and
+the steps consumers should take to regenerate configs, rebuild hooks, or update
+their integration.
+
+The normal upgrade path is:
+
+1. Update the installed package or checkout to the new release.
+2. Run `make build` so generated configs, hook runtimes, managed tools, MCP
+   settings, skills, and prompt packs are refreshed.
+3. Run `make check-tool-configs` to detect generated config drift.
+4. Run the project gate, normally `make check`.
+5. Review the release notes for any release-specific migration steps.
+
+### Hook timeout ceiling migration
+
+Before upgrading a consumer that sets `hooks.tool_timeout_seconds`, reduce any
+value from 601 through 900 to 600 seconds or less. Those former values now
+produce a FATAL configuration error and intentionally block pre-commit and
+pre-push: a hook running longer than ten minutes is a critical failure, not a
+normal operating mode.
+
+## Pre-Release Checklist
+
+- [ ] Prepare release metadata on a release branch or use the documented
+  admin-approved maintainer path for a deliberate direct release commit on
+  `main`.
+- [ ] Update `CHANGELOG.md`.
+- [ ] Update all version metadata listed in the Versioning section when cutting
+  a release.
+- [ ] Run `make check`.
+- [ ] Run generated config verification for any changed config surfaces.
+- [ ] Verify the release workflow `Dynamic analysis` job passed. This job runs
+      Go fuzzing against the shell parser, SARIF formatter, hook event decoder,
+      and CEL input construction before release artifacts can be built or
+      published.
+- [ ] Verify GitHub Actions and SARIF gates are green on the release PR.
+- [ ] Verify OpenSSF Scorecard has a recent successful run on `main`.
+- [ ] Refresh pinned GitHub Action SHAs after reviewing upstream release notes
+  for each action used by `.github/workflows/*.yml`.
+- [ ] Verify `[tool.uv].exclude-newer = "7 days"` remains present in every
+  project `pyproject.toml` before refreshing lock files.
+- [ ] Review any `[tool.uv].exclude-newer-package` override and keep only
+  package-specific exceptions required for security updates inside the global
+  dependency cooldown window.
+- [ ] Verify `SECURITY.md`, `README.md`, and `docs/index.md` still describe
+  the supported install and reporting paths.
+- [ ] Confirm no local paths, secrets, or generated runtime outputs are staged.
+
+## Build Artifacts
+
+The supported local build path is:
+
+```bash
+make build
+```
+
+The supported validation path is:
+
+```bash
+make check
+```
+
+If publishing Python distributions:
+
+```bash
+make release-dry-run
+```
+
+Before publishing, run the GitHub `Release` workflow manually with `dry_run`
+enabled. That exercises the hosted release job, OIDC permissions, GitHub
+artifact attestations, checksum generation, and SBOM generation while skipping
+GitHub release creation and PyPI publication.
+
+Do not upload to PyPI until release artifacts have provenance. The GitHub
+Actions build distribution job validates package metadata with `uvx twine
+check dist/*.tar.gz dist/*.whl`, generates SHA-256 checksums, and uses GitHub
+artifact attestations for both `dist/*.tar.gz`/`dist/*.whl` and
+`dist-checksums/SHA256SUMS`. It also generates an SPDX JSON SBOM at
+`sbom/coding-ethos.spdx.json` and creates an SBOM attestation bound to the
+distribution artifact checksums. Treat those attestations as the prerequisite
+for any certified PyPI upload.
+
+The supported release path is the `.github/workflows/release.yml` workflow
+triggered by pushing a signed `v*` tag. The workflow builds and attests
+artifacts, exports offline `.intoto.jsonl` attestation bundles, creates a draft
+GitHub release with the distributions, checksums, SBOM, and attestation bundles
+already attached, publishes the release as immutable, then publishes to PyPI
+through the protected `pypi` GitHub environment after the required environment
+approval. This ordering is required for GitHub immutable releases: assets must
+be attached before publication rather than uploaded after the release is
+published.
+
+PyPI upload uses OIDC Trusted Publishing through
+`pypa/gh-action-pypi-publish`, and enables PyPI digital attestations. Configure
+the corresponding Trusted Publisher in PyPI before cutting a release:
+
+- owner: `paudley`
+- repository: `coding-ethos`
+- workflow: `release.yml`
+- environment: `pypi`
+
+Create the GitHub environment before the first release:
+
+```bash
+gh api repos/ethosure/coding_ethos/environments/pypi \
+  --method PUT \
+  --field wait_timer=0
+```
+
+Then configure required reviewers in the GitHub UI or with the GitHub API if
+the project has more than one maintainer. PyPI must also be configured with the
+Trusted Publisher tuple above before the workflow can publish without an API
+token.
+
+Consumers can verify GitHub artifact attestations with:
+
+```bash
+gh attestation verify dist/coding_ethos-*.tar.gz \
+  --repo ethosure/coding_ethos
+gh attestation verify dist/coding_ethos-*.whl \
+  --repo ethosure/coding_ethos
+gh attestation verify dist-checksums/SHA256SUMS \
+  --repo ethosure/coding_ethos
+gh attestation verify dist/coding_ethos-*.whl \
+  --repo ethosure/coding_ethos \
+  --predicate-type https://spdx.dev/Document
+```
+
+After a PyPI release, verify PyPI publish attestations with the current PyPI
+attestation tooling and a concrete distribution file URL from PyPI:
+
+```bash
+uvx pypi-attestations verify pypi \
+  --repository https://github.com/ethosure/coding_ethos \
+  https://files.pythonhosted.org/.../coding_ethos-0.3.0-py3-none-any.whl
+```
+
+If publishing compiled Go helper binaries, attach checksums and document:
+
+- target OS and architecture
+- build command
+- source commit
+- checksum algorithm
+- whether the artifact is required or optional
+
+## Release Notes
+
+Release notes should include:
+
+- summary of user-visible changes
+- supported upgrade path
+- new or changed hooks, MCP tools, CEL inputs, SARIF behavior, or generated
+  config
+- migration notes for consumer repos
+- verification evidence
+- known limitations
+
+Template:
+
+```markdown
+## Summary
+
+-
+
+## Added
+
+-
+
+## Changed
+
+-
+
+## Migration Notes
+
+-
+
+## Verification
+
+- `make check`
+- GitHub Actions CI
+- Coding Ethos SARIF Gate
+- Build distribution and artifact attestation
+- SPDX SBOM artifact and SBOM attestation
+- OpenSSF Scorecard
+- PyPI Trusted Publishing attestations
+
+## Known Limitations
+
+-
+```
+
+## Post-Release Checklist
+
+- [ ] Push the signed release tag.
+- [ ] Verify the release workflow created the GitHub release.
+- [ ] Verify GitHub release distributions, checksums, SBOM, and `.intoto.jsonl`
+  attestation bundles were attached before publication by the release workflow.
+- [ ] Approve the protected `pypi` environment deployment when the GitHub
+  release job has succeeded and the release assets are present.
+- [ ] Verify PyPI shows digital attestations for the uploaded release files.
+- [ ] Verify release links from `README.md` and package metadata.
+- [ ] Update OpenSSF Scorecard and Best Practices tracking in
+  `docs/TRUST_SIGNALS.md`.
+- [ ] Announce the release using copy maintained outside the repo.

@@ -1,0 +1,24 @@
+.coding_ethos_sarif:
+  stage: test
+  variables:
+    CODING_ETHOS_PATH: coding-ethos
+    CODING_ETHOS_REPO_ROOT: .
+    CODING_ETHOS_GATE_COMMAND: make check
+    CODING_ETHOS_SARIF_PATH: coding-ethos.sarif
+    CODING_ETHOS_FILES: ""
+  script:
+    - make -C "$CODING_ETHOS_PATH" build
+    - |
+      if [ -n "$CODING_ETHOS_GATE_COMMAND" ]; then
+        cd "$CODING_ETHOS_REPO_ROOT"
+        export CODING_ETHOS_GATE_COMMAND
+        bash -c '$CODING_ETHOS_GATE_COMMAND'
+        cd "$CI_PROJECT_DIR"
+      fi
+    - "$CODING_ETHOS_PATH/bin/coding-ethos-run ci-sarif --provider gitlab"
+  artifacts:
+    when: always
+    paths:
+      - "$CODING_ETHOS_SARIF_PATH"
+      - .coding-ethos/lint-runs/
+      - .coding-ethos/hook-runs/

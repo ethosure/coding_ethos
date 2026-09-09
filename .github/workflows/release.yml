@@ -1,0 +1,261 @@
+# SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build, attest, and upload artifacts without publishing.
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  dynamic-analysis:
+    name: Dynamic analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version-file: go/go.mod
+          cache: false
+
+      - name: Fuzz shell parser
+        run: go test ./internal/shellparse -run '^$' -fuzz Fuzz -fuzztime=30s
+        working-directory: go
+
+      - name: Fuzz SARIF formatter
+        run: go test ./internal/hookoutput -run '^$' -fuzz Fuzz -fuzztime=30s
+        working-directory: go
+
+      - name: Fuzz hook event decoder
+        run: go test ./internal/hooks -run '^$' -fuzz Fuzz -fuzztime=30s
+        working-directory: go
+
+      - name: Fuzz CEL input construction
+        run: go test ./internal/celexpr -run '^$' -fuzz Fuzz -fuzztime=20s
+        working-directory: go
+
+  build:
+    name: Build attested distributions
+    needs: dynamic-analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          enable-cache: false
+
+      - name: Build package
+        run: uv build
+
+      - name: Validate package metadata
+        run: uvx twine check dist/*.tar.gz dist/*.whl
+
+      - name: Generate distribution checksums
+        run: |
+          mkdir -p dist-checksums
+          sha256sum dist/*.tar.gz dist/*.whl > dist-checksums/SHA256SUMS
+
+      - name: Prepare SBOM output directory
+        run: mkdir -p sbom
+
+      - name: Generate distribution SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
+        with:
+          path: .
+          output-file: sbom/coding-ethos.spdx.json
+          format: spdx-json
+          upload-artifact: false
+
+      - name: Attest distribution artifacts
+        # SLSA provenance binds each built distribution to this repository,
+        # workflow identity, commit, and tag event through GitHub OIDC.
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.whl
+
+      - name: Attest distribution checksums
+        # The checksum file is attached to the release for consumers and gets
+        # separate provenance from the files it describes.
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
+        with:
+          subject-path: dist-checksums/SHA256SUMS
+
+      - name: Attest distribution SBOM
+        # SBOM mode binds the SPDX document to the distribution subjects listed
+        # in SHA256SUMS. Keep this on actions/attest rather than the deprecated
+        # attest-sbom wrapper.
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
+        with:
+          subject-checksums: dist-checksums/SHA256SUMS
+          sbom-path: sbom/coding-ethos.spdx.json
+
+      - name: Upload distribution artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Upload distribution checksums
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: dist-checksums
+          path: dist-checksums/SHA256SUMS
+          if-no-files-found: error
+
+      - name: Upload distribution SBOM
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: dist-sbom
+          path: sbom/coding-ethos.spdx.json
+          if-no-files-found: error
+
+      - name: Record release dry-run result
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          {
+            echo "## Release dry run"
+            echo
+            echo "Built distributions, checksums, SBOM, and GitHub attestations."
+            echo "Skipped GitHub release creation and PyPI publishing."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish-github-release:
+    name: Publish GitHub release with trust artifacts
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      attestations: read
+      contents: write
+
+    steps:
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: dist
+          path: dist
+
+      - name: Download distribution checksums
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: dist-checksums
+          path: dist-checksums
+
+      - name: Download distribution SBOM
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: dist-sbom
+          path: sbom
+
+      - name: Export offline attestation bundles
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p attestations
+          # SBOM attestations are bound to the distribution subjects listed in
+          # SHA256SUMS, not to the SBOM file itself. Export bundles only for
+          # subjects that GitHub can resolve directly.
+          artifacts="dist/* dist-checksums/SHA256SUMS"
+          for artifact in $artifacts; do
+            rm -f sha256-*.jsonl "sha256:"*.jsonl
+            gh attestation download "$artifact" --repo "$GITHUB_REPOSITORY"
+            bundle="$(find . -maxdepth 1 -type f -name 'sha256*.jsonl' | head -n 1)"
+            if [ -z "$bundle" ]; then
+              echo "No attestation bundle downloaded for $artifact" >&2
+              exit 1
+            fi
+            cp "$bundle" "attestations/$(basename "$artifact").intoto.jsonl"
+            rm -f "$bundle"
+          done
+
+      - name: Create immutable-ready GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --draft \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/* \
+            dist-checksums/SHA256SUMS \
+            sbom/coding-ethos.spdx.json \
+            attestations/*.intoto.jsonl
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --latest
+
+  publish-pypi:
+    name: Publish to PyPI with attestations
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    needs:
+      - build
+      - publish-github-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/coding-ethos/
+    permissions:
+      actions: read
+      id-token: write
+
+    steps:
+      - name: Download distribution artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish distributions to PyPI
+        # Trusted Publishing exchanges the job OIDC identity for a short-lived
+        # PyPI publish token. No Twine credentials or PyPI API token are stored
+        # in GitHub secrets.
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
+        with:
+          attestations: true

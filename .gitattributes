@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+* text=auto eol=lf
+*.yaml whitespace=trailing-space,space-before-tab
+*.yml whitespace=trailing-space,space-before-tab
+*.json whitespace=trailing-space,space-before-tab
+*.md whitespace=trailing-space,space-before-tab
+*.py whitespace=trailing-space,space-before-tab

@@ -1,0 +1,359 @@
+// SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package codeintel
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"strings"
+
+	"github.com/ethosure/coding_ethos/go/internal/evidence"
+)
+
+const (
+	hybridCandidateMultiplier = 2
+	indexStatusRecordLimit    = 100000
+)
+
+func (store *Store) HybridSearch(
+	ctx context.Context,
+	index evidence.VectorIndex,
+	query HybridSearchQuery,
+) ([]HybridSearchResult, error) {
+	limit := query.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+
+	resultMap := map[string]HybridSearchResult{}
+
+	if strings.TrimSpace(query.Text) != "" {
+		ftsResults, err := store.Search(
+			ctx,
+			SearchQuery{
+				Text:       query.Text,
+				RecordKind: query.RecordKind,
+				Limit:      limit * hybridCandidateMultiplier,
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		for position, result := range ftsResults {
+			item := hybridFromFTS(result, position)
+			if !hybridMatches(item, query) {
+				continue
+			}
+
+			resultMap[hybridKey(item)] = item
+		}
+	}
+
+	if len(query.Vector) > 0 {
+		err := store.addHybridVectorMatches(ctx, index, query, limit, resultMap)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	results := make([]HybridSearchResult, 0, len(resultMap))
+	for _, result := range resultMap {
+		result = applyOutcomeScore(result)
+		results = append(results, result)
+	}
+
+	slices.SortFunc(results, func(left, right HybridSearchResult) int {
+		if left.Score != right.Score {
+			if left.Score > right.Score {
+				return -1
+			}
+
+			return 1
+		}
+
+		return strings.Compare(left.RecordID, right.RecordID)
+	})
+
+	if len(results) > limit {
+		results = results[:limit]
+	}
+
+	return results, nil
+}
+
+func (store *Store) addHybridVectorMatches(
+	ctx context.Context,
+	index evidence.VectorIndex,
+	query HybridSearchQuery,
+	limit int,
+	resultMap map[string]HybridSearchResult,
+) error {
+	vectorResults, err := index.Search(ctx, evidence.VectorQuery{
+		Collection: firstNonEmpty(query.Collection, "remediations"),
+		ModelID:    query.ModelID,
+		Vector:     query.Vector,
+		Filters:    hybridVectorFilters(query),
+		Limit:      limit * hybridCandidateMultiplier,
+	})
+	if err != nil {
+		return fmt.Errorf("search vector index: %w", err)
+	}
+
+	for _, match := range vectorResults {
+		item := hybridFromVector(match)
+		if !hybridMatches(item, query) {
+			continue
+		}
+
+		active, err := store.hybridVectorRecordActive(ctx, item)
+		if err != nil {
+			return err
+		}
+
+		if !active {
+			continue
+		}
+
+		mergeHybridVectorMatch(resultMap, item, match)
+	}
+
+	return nil
+}
+
+func (store *Store) hybridVectorRecordActive(
+	ctx context.Context,
+	item HybridSearchResult,
+) (bool, error) {
+	if item.Kind != "code_chunk" {
+		return true, nil
+	}
+
+	row := store.database.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*)
+		FROM code_chunks
+		JOIN code_files ON code_files.path = code_chunks.path
+		WHERE chunk_id = ?
+			AND COALESCE(code_files.deleted_at_utc, '') = ''`,
+		item.RecordID,
+	)
+
+	var count int
+
+	err := row.Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("query active vector code chunk %q: %w", item.RecordID, err)
+	}
+
+	return count > 0, nil
+}
+
+func mergeHybridVectorMatch(
+	resultMap map[string]HybridSearchResult,
+	item HybridSearchResult,
+	match evidence.VectorMatch,
+) {
+	key := hybridKey(item)
+
+	existing, found := resultMap[key]
+	if !found {
+		resultMap[key] = item
+
+		return
+	}
+
+	existing.Source = joinSource(existing.Source, "vector")
+	existing.VectorID = match.ID
+
+	existing.VectorScore = match.Score
+	if existing.Outcome == "" {
+		existing.Outcome = item.Outcome
+	}
+
+	if len(existing.Metadata) == 0 {
+		existing.Metadata = item.Metadata
+	}
+
+	existing.Score += match.Score * hybridCandidateMultiplier
+	resultMap[key] = existing
+}
+
+func (store *Store) IndexStatus(
+	ctx context.Context,
+	vectorStats evidence.VectorStats,
+	query EmbeddingRecordQuery,
+) (IndexStatus, error) {
+	stats, err := store.Stats(ctx)
+	if err != nil {
+		return IndexStatus{}, err
+	}
+
+	records, err := store.EmbeddingRecords(ctx, EmbeddingRecordQuery{
+		Backend:    query.Backend,
+		Collection: query.Collection,
+		ModelID:    query.ModelID,
+		Limit:      indexStatusRecordLimit,
+	})
+	if err != nil {
+		return IndexStatus{}, err
+	}
+
+	status := IndexStatus{
+		Stats:            stats,
+		VectorStats:      vectorStats,
+		EmbeddingRecords: len(records),
+		Backend:          query.Backend,
+		ModelID:          query.ModelID,
+		Collection:       query.Collection,
+	}
+
+	codeChunks, err := store.activeCodeChunkCount(ctx)
+	if err != nil {
+		return IndexStatus{}, err
+	}
+
+	status.ReadyRecords = stats.SARIFResults + stats.RemediationOutcomes +
+		stats.Remediations + codeChunks
+
+	status.MissingVectors = max(status.ReadyRecords-status.EmbeddingRecords, 0)
+
+	status.Fresh = status.MissingVectors == 0
+
+	return status, nil
+}
+
+func (store *Store) activeCodeChunkCount(ctx context.Context) (int, error) {
+	row := store.database.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*)
+		FROM code_chunks
+		JOIN code_files ON code_files.path = code_chunks.path
+		WHERE COALESCE(code_files.deleted_at_utc, '') = ''`,
+	)
+
+	var count int
+
+	err := row.Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("query active code chunk count: %w", err)
+	}
+
+	return count, nil
+}
+
+func hybridFromFTS(result SearchResult, position int) HybridSearchResult {
+	return HybridSearchResult{
+		Kind:     result.Kind,
+		RecordID: result.RecordID,
+		TraceID:  result.TraceID,
+		PolicyID: result.PolicyID,
+		SkillID:  result.SkillID,
+		Path:     result.Path,
+		Message:  result.Message,
+		Source:   "fts",
+		Score:    1 / float64(position+1),
+		FTSScore: 1 / float64(position+1),
+	}
+}
+
+func hybridFromVector(match evidence.VectorMatch) HybridSearchResult {
+	metadata := match.Metadata
+	kind := firstNonEmpty(metadata["record_kind"], metadata["kind"])
+	recordID := firstNonEmpty(metadata["record_id"], match.ID)
+
+	return HybridSearchResult{
+		Metadata:    metadata,
+		Kind:        kind,
+		RecordID:    recordID,
+		TraceID:     metadata["trace_id"],
+		PolicyID:    metadata["policy_id"],
+		SkillID:     metadata["skill_id"],
+		Path:        metadata["path"],
+		Message:     metadata["message"],
+		Source:      "vector",
+		Outcome:     metadata["outcome"],
+		VectorID:    match.ID,
+		Score:       match.Score * hybridCandidateMultiplier,
+		VectorScore: match.Score,
+	}
+}
+
+func hybridVectorFilters(query HybridSearchQuery) map[string]string {
+	filters := map[string]string{}
+
+	for key, value := range query.Filters {
+		if strings.TrimSpace(value) != "" {
+			filters[key] = strings.TrimSpace(value)
+		}
+	}
+
+	if strings.TrimSpace(query.PolicyID) != "" {
+		filters["policy_id"] = strings.TrimSpace(query.PolicyID)
+	}
+
+	if strings.TrimSpace(query.RecordKind) != "" {
+		filters["record_kind"] = strings.TrimSpace(query.RecordKind)
+	}
+
+	if strings.TrimSpace(query.SkillID) != "" {
+		filters["skill_id"] = strings.TrimSpace(query.SkillID)
+	}
+
+	if strings.TrimSpace(query.Path) != "" {
+		filters["path"] = strings.TrimSpace(query.Path)
+	}
+
+	return filters
+}
+
+func hybridMatches(result HybridSearchResult, query HybridSearchQuery) bool {
+	if strings.TrimSpace(query.PolicyID) != "" && result.PolicyID != query.PolicyID {
+		return false
+	}
+
+	if strings.TrimSpace(query.RecordKind) != "" && result.Kind != query.RecordKind {
+		return false
+	}
+
+	if strings.TrimSpace(query.SkillID) != "" && result.SkillID != query.SkillID {
+		return false
+	}
+
+	if strings.TrimSpace(query.Path) != "" && result.Path != query.Path {
+		return false
+	}
+
+	return true
+}
+
+func hybridKey(result HybridSearchResult) string {
+	return result.Kind + "\x00" + result.RecordID
+}
+
+func joinSource(left, right string) string {
+	if left == "" {
+		return right
+	}
+
+	if right == "" || strings.Contains(left, right) {
+		return left
+	}
+
+	return left + "+" + right
+}
+
+func applyOutcomeScore(result HybridSearchResult) HybridSearchResult {
+	switch result.Outcome {
+	case "fixed":
+		result.Score += 2
+	case "repeated":
+		result.Score -= 1
+	case "superseded":
+		result.Score -= 0.5
+	}
+
+	return result
+}

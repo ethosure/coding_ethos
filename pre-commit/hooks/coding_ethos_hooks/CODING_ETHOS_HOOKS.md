@@ -1,0 +1,30 @@
+<!-- SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com> -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+
+# coding-ethos-hooks
+
+Go hook utilities for coding-ethos bundles.
+
+## Overview
+
+This package provides shared utilities for coding-ethos Go hooks.
+
+## Available Hooks
+
+The parent `pre-commit/hooks/` directory contains the actual hook implementations:
+
+- `go/cmd/coding-ethos-hook-runner/` - Compiled policy preflight, generic file checks, shell checks,
+  direct-import enforcement, utility and SQL centralization, file and module doc
+  checks, type-check orchestration, Python quality orchestration, pytest gating,
+  comment suppression enforcement, manifest and plan validation, compiled
+  `python.pyproject_ignores` enforcement, repo-specific PII/ignore/license
+  policies, repo-root Python version consistency checks, shared hook policy, and
+  the active Gemini AI review runner
+
+## Installation
+
+Hooks are installed from the repository root with `make install-hooks` or, in a
+consuming repo, `make -C coding-ethos install-hooks`. The bundle reads merged
+policy from the repo-root `config.yaml` plus optional consumer override YAML and
+compiles that policy for the Git hook, agent hook, git wrapper, and lint
+entrypoints.

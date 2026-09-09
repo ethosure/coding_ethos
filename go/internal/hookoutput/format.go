@@ -1,0 +1,456 @@
+// SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package hookoutput
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"strconv"
+	"strings"
+
+	"github.com/ethosure/coding_ethos/go/diagnostics"
+	"github.com/ethosure/coding_ethos/go/internal/agentmsg"
+	"github.com/ethosure/coding_ethos/go/internal/lint"
+)
+
+const (
+	FormatAuto  = "auto"
+	FormatHuman = "human"
+	FormatJSON  = "json"
+	FormatSARIF = "sarif"
+	FormatTOON  = "toon"
+	FormatEnv   = "CODE_ETHOS_HOOK_OUTPUT_FORMAT"
+
+	maxTOONFindingCellRunes = 320
+	toonFindingHeaderLines  = 3
+)
+
+var errMalformedLintDiagnostic = errors.New(
+	"lint output is malformed: diagnostic missing message",
+)
+
+func SelectedFormat() string {
+	return SelectedFormatWithEnv(os.Getenv)
+}
+
+func SelectedFormatWithEnv(getenv func(string) string) string {
+	format := strings.ToLower(strings.TrimSpace(getenv(FormatEnv)))
+	switch format {
+	case FormatHuman, FormatJSON, FormatTOON:
+		return format
+	case "", FormatAuto:
+		if IsAgentEnvironment(getenv) {
+			return FormatTOON
+		}
+
+		return FormatHuman
+	default:
+		return FormatHuman
+	}
+}
+
+func IsAgentEnvironment(getenv func(string) string) bool {
+	for _, marker := range AgentEnvironmentMarkers() {
+		if strings.TrimSpace(getenv(marker)) != "" {
+			return true
+		}
+	}
+
+	return false
+}
+
+func AgentEnvironmentMarkers() []string {
+	return []string{
+		"CODEX_THREAD_ID",
+		"CODEX_CI",
+		"CODEX_MANAGED_BY_NPM",
+		"CLAUDECODE",
+		"CLAUDE_CODE_ENTRYPOINT",
+		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+		"GEMINI_CLI",
+		"AIDER_MODEL",
+		"CURSOR_TRACE_ID",
+	}
+}
+
+func TOONCell(value string) string {
+	cleaned := strings.TrimSpace(value)
+	cleaned = strings.ReplaceAll(cleaned, "\\", "\\\\")
+	cleaned = strings.ReplaceAll(cleaned, "\r\n", "\\n")
+	cleaned = strings.ReplaceAll(cleaned, "\n", "\\n")
+	cleaned = strings.ReplaceAll(cleaned, ",", "\\,")
+
+	return cleaned
+}
+
+func TOONFindingCell(value string) string {
+	cleaned := TOONCell(value)
+
+	runes := []rune(cleaned)
+	if len(runes) <= maxTOONFindingCellRunes {
+		return cleaned
+	}
+
+	return string(runes[:maxTOONFindingCellRunes]) + "...[truncated]"
+}
+
+func FormatLintResult(result lint.Result, format string) (string, error) {
+	lint.EnsureTraceID(&result)
+
+	switch format {
+	case FormatJSON:
+		return FormatLintResultJSON(result)
+	case FormatSARIF:
+		return FormatLintResultSARIF(result)
+	case FormatTOON:
+		return FormatLintResultTOON(result)
+	default:
+		return FormatLintResultHuman(result)
+	}
+}
+
+func WriteLintSARIFSidecar(tracePath string, result lint.Result) error {
+	output, err := FormatLintResult(result, FormatSARIF)
+	if err != nil {
+		return fmt.Errorf("format lint trace as SARIF: %w", err)
+	}
+
+	err = lint.WriteSARIFSidecar(tracePath, output)
+	if err != nil {
+		return fmt.Errorf("write lint SARIF sidecar: %w", err)
+	}
+
+	return nil
+}
+
+func EncodeLintResult(writer io.Writer, result lint.Result, format string) error {
+	output, err := FormatLintResult(result, format)
+	if err != nil {
+		return fmt.Errorf("format lint result: %w", err)
+	}
+
+	_, err = fmt.Fprintln(writer, output)
+	if err != nil {
+		return fmt.Errorf("write lint result: %w", err)
+	}
+
+	return nil
+}
+
+func FormatLintResultJSON(result lint.Result) (string, error) {
+	diagnostics := lint.OutputDiagnostics(result)
+	payload := struct {
+		lint.Result
+
+		AgentRemediation []agentmsg.Remediation `json:"agent_remediation,omitempty"`
+	}{
+		Result:           result,
+		AgentRemediation: agentmsg.FromDiagnostics(diagnostics),
+	}
+
+	var builder strings.Builder
+
+	encoder := json.NewEncoder(&builder)
+	encoder.SetEscapeHTML(false)
+	encoder.SetIndent("", "  ")
+
+	err := encoder.Encode(payload)
+	if err != nil {
+		return "", fmt.Errorf("encode hook output JSON: %w", err)
+	}
+
+	return strings.TrimRight(builder.String(), "\n"), nil
+}
+
+func FormatLintResultTOON(result lint.Result) (string, error) {
+	findings := userFacingDiagnostics(result)
+
+	err := validateUserFacingDiagnostics(findings)
+	if err != nil {
+		return "", err
+	}
+
+	status := lint.ResultStatus(result)
+
+	lines := toonHeaderLines(result, status)
+	if result.TraceID != "" {
+		lines = append(lines, "trace_id: "+TOONCell(result.TraceID))
+	}
+
+	lines = append(lines, toonFindingLines(result, findings)...)
+	lines = append(lines, toonAdviceLines(result.SkillHints)...)
+
+	if remediation := agentmsg.FromDiagnostics(findings); len(remediation) > 0 {
+		lines = append(lines, toonRemediationLines(remediation)...)
+	}
+
+	if result.Blocked() {
+		lines = append(
+			lines,
+			"guidance[1]{message}:",
+			"  Fix the reported diagnostics before continuing.",
+		)
+	}
+
+	return strings.Join(lines, "\n"), nil
+}
+
+func toonHeaderLines(result lint.Result, status string) []string {
+	return []string{
+		"tool: " + TOONCell(lint.ResultTool(result)),
+		"status: " + TOONCell(status),
+	}
+}
+
+func toonFindingLines(result lint.Result, findings []diagnostics.Diagnostic) []string {
+	lines := make([]string, 0, toonFindingHeaderLines+len(findings))
+	lines = append(lines,
+		"title: "+TOONCell(lintResultTitle(result)),
+		"scope: "+TOONCell(result.Scope),
+		fmt.Sprintf(
+			"findings[%d]"+
+				"{tool,file,line,column,severity,code,policy_id,skill_id,message,advice,detail}:",
+			len(findings),
+		),
+	)
+
+	for _, finding := range findings {
+		lines = append(lines, toonFindingLine(finding))
+	}
+
+	return lines
+}
+
+func toonFindingLine(finding diagnostics.Diagnostic) string {
+	return fmt.Sprintf(
+		"  %s,%s,%d,%d,%s,%s,%s,%s,%s,%s,%s",
+		TOONCell(finding.Tool),
+		TOONCell(finding.File),
+		finding.Line,
+		finding.Column,
+		TOONCell(finding.Severity),
+		TOONCell(finding.Code),
+		TOONCell(finding.PolicyID),
+		TOONCell(finding.SkillID),
+		TOONFindingCell(finding.Message),
+		TOONFindingCell(finding.Advice),
+		TOONFindingCell(finding.Detail),
+	)
+}
+
+func toonAdviceLines(hints []lint.SkillHint) []string {
+	if len(hints) == 0 {
+		return nil
+	}
+
+	lines := []string{
+		fmt.Sprintf("advice[%d]{skill_id,message}:", len(hints)),
+	}
+	for _, hint := range hints {
+		lines = append(lines, fmt.Sprintf(
+			"  %s,%s",
+			TOONCell(hint.SkillID),
+			TOONFindingCell(compactSkillHintMessage(hint.Message)),
+		))
+	}
+
+	return lines
+}
+
+func toonRemediationLines(remediation []agentmsg.Remediation) []string {
+	lines := make([]string, 0, 1+len(remediation))
+
+	lines = append(lines,
+		fmt.Sprintf(
+			"agent_remediation[%d]{policy_id,skill_id,file,line,next,mcp_tool}:",
+			len(remediation),
+		),
+	)
+	for _, item := range remediation {
+		lines = append(lines, fmt.Sprintf(
+			"  %s,%s,%s,%d,%s,%s",
+			TOONCell(item.PolicyID),
+			TOONCell(item.SkillID),
+			TOONCell(item.File),
+			item.Line,
+			TOONFindingCell(firstRemediationStep(item)),
+			TOONCell(remediationMCPTool(item)),
+		))
+	}
+
+	return lines
+}
+
+func firstRemediationStep(item agentmsg.Remediation) string {
+	if len(item.NextSteps) == 0 {
+		return item.Advice
+	}
+
+	return item.NextSteps[0]
+}
+
+func remediationMCPTool(item agentmsg.Remediation) string {
+	if item.MCP == nil {
+		return ""
+	}
+
+	return item.MCP.Tool
+}
+
+func compactSkillHintMessage(message string) string {
+	normalized := strings.Join(strings.Fields(message), " ")
+	if normalized == "" {
+		return ""
+	}
+
+	if sentence, _, ok := strings.Cut(normalized, ". "); ok && sentence != "" {
+		return sentence + "."
+	}
+
+	return normalized
+}
+
+func FormatLintResultHuman(result lint.Result) (string, error) {
+	findings := userFacingDiagnostics(result)
+
+	err := validateUserFacingDiagnostics(findings)
+	if err != nil {
+		return "", err
+	}
+
+	lines := []string{
+		"coding-ethos lint result: " + lint.ResultStatus(result),
+		"tool: " + lint.ResultTool(result),
+		"scope: " + result.Scope,
+	}
+	if result.TraceID != "" {
+		lines = append(lines, "trace_id: "+result.TraceID)
+	}
+
+	for _, finding := range findings {
+		location := finding.File
+		if finding.Line > 0 {
+			location += ":" + strconv.Itoa(finding.Line)
+		}
+
+		lines = append(lines, fmt.Sprintf(
+			"- %s [%s] %s",
+			location,
+			firstOutputLabel(finding.PolicyID, finding.Tool),
+			finding.Message,
+		))
+		if finding.Advice != "" {
+			lines = append(lines, "  advice: "+finding.Advice)
+		}
+
+		if finding.Detail != "" {
+			lines = append(lines, "  detail: "+finding.Detail)
+		}
+	}
+
+	if len(result.SkillHints) > 0 {
+		lines = append(lines, "skill advice:")
+		for _, hint := range result.SkillHints {
+			lines = append(
+				lines,
+				"- "+hint.SkillID+": "+hint.Message+" Next: "+hint.Next,
+			)
+		}
+	}
+
+	if result.Blocked() {
+		lines = append(lines, "Fix the reported diagnostics before continuing.")
+	}
+
+	return strings.Join(lines, "\n"), nil
+}
+
+func validateUserFacingDiagnostics(items []diagnostics.Diagnostic) error {
+	for _, item := range items {
+		if strings.TrimSpace(item.Message) != "" {
+			continue
+		}
+
+		return fmt.Errorf(
+			"%w "+
+				"(tool=%q file=%q line=%d code=%q policy_id=%q)",
+			errMalformedLintDiagnostic,
+			item.Tool,
+			item.File,
+			item.Line,
+			item.Code,
+			item.PolicyID,
+		)
+	}
+
+	return nil
+}
+
+func userFacingDiagnostics(result lint.Result) []diagnostics.Diagnostic {
+	diagnostics := lint.OutputDiagnostics(result)
+	actionable := actionableDiagnostics(diagnostics)
+
+	if len(actionable) > 0 {
+		return actionable
+	}
+
+	if len(result.Diagnostics) > 0 && diagnosticsAreRecords(result.Diagnostics) &&
+		len(result.Findings) > 0 {
+		findings := lint.FindingDiagnostics(result.Findings, result.Blocked())
+
+		return findings
+	}
+
+	if diagnosticsAreRecords(diagnostics) {
+		return nil
+	}
+
+	return diagnostics
+}
+
+func actionableDiagnostics(
+	items []diagnostics.Diagnostic,
+) []diagnostics.Diagnostic {
+	actionable := make([]diagnostics.Diagnostic, 0, len(items))
+	for _, item := range items {
+		if item.Severity == "record" {
+			continue
+		}
+
+		actionable = append(actionable, item)
+	}
+
+	return actionable
+}
+
+func diagnosticsAreRecords(items []diagnostics.Diagnostic) bool {
+	for _, item := range items {
+		if item.Severity != "record" {
+			return false
+		}
+	}
+
+	return len(items) > 0
+}
+
+func lintResultTitle(result lint.Result) string {
+	if result.Blocked() {
+		return "LINT FAILED"
+	}
+
+	return "LINT RESULTS"
+}
+
+func firstOutputLabel(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+
+	return ""
+}

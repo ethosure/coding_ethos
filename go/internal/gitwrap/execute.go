@@ -1,0 +1,151 @@
+// SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package gitwrap
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+
+	"github.com/ethosure/coding_ethos/go/internal/evaluators"
+	"github.com/ethosure/coding_ethos/go/internal/policy"
+	"github.com/ethosure/coding_ethos/go/internal/realgit"
+)
+
+const adminApprovedEnv = "CODE_ETHOS_ADMIN_APPROVED"
+
+func Execute(realGit string, options Options) error {
+	normalized := normalizeArgv(options.Argv)
+	normalized = forceSignedGitArgs(normalized)
+
+	cmd := realgit.CommandFor(context.Background(), realGit, false, normalized[1:]...)
+	if options.Cwd != "" {
+		cmd.Dir = options.Cwd
+	}
+
+	if len(options.Stdin) > 0 {
+		cmd.Stdin = bytes.NewReader(options.Stdin)
+	} else {
+		cmd.Stdin = os.Stdin
+	}
+
+	cmd.Stdout = os.Stdout
+
+	cmd.Stderr = os.Stderr
+	cmd.Env = gitExecutionEnv(options.AdminApproved)
+
+	err := cmd.Run()
+	if err != nil {
+		var exitError *exec.ExitError
+		if errors.As(err, &exitError) {
+			return ExitCodeError{Code: exitError.ExitCode()}
+		}
+
+		return fmt.Errorf("execute git: %w", err)
+	}
+
+	return nil
+}
+
+func PreparePost(bundle policy.Bundle, options Options) error {
+	_, err := evaluatePostPolicies(bundle, options, "PreToolUse")
+
+	return err
+}
+
+func VerifyPost(bundle policy.Bundle, options Options) (Result, error) {
+	return evaluatePostPolicies(bundle, options, "PostToolUse")
+}
+
+func evaluatePostPolicies(
+	bundle policy.Bundle,
+	options Options,
+	scope string,
+) (Result, error) {
+	return evaluatePostPoliciesWithRegistry(
+		bundle,
+		options,
+		scope,
+		evaluators.DefaultRegistry(),
+	)
+}
+
+func evaluatePostPoliciesWithRegistry(
+	bundle policy.Bundle,
+	options Options,
+	scope string,
+	registry evaluators.Registry,
+) (Result, error) {
+	parsed := ParseArgv(options.Argv)
+	argv := parsed.Argv
+
+	operation := parsed.Operation
+	if operation == "" {
+		return Result{Argv: argv, Status: statusAllowed}, nil
+	}
+
+	decisions := []policy.Decision{}
+	if scope == "PostToolUse" {
+		decisions = append(decisions, gitSigningPostDecisions(options, operation)...)
+	}
+
+	policyIDs := gitPostPolicyIDs(bundle, operation)
+	if len(policyIDs) == 0 {
+		return Result{
+			Argv:      argv,
+			Operation: operation,
+			Status:    resultStatus(decisions),
+			Decisions: decisions,
+		}, nil
+	}
+
+	for _, policyID := range policyIDs {
+		policyDef, ok := bundle.Policies[policyID]
+		if !ok {
+			return Result{}, fmt.Errorf(
+				"%w: %q post references %q",
+				errUnknownGitPolicy,
+				operation,
+				policyID,
+			)
+		}
+
+		evaluated, err := evaluateGitPolicy(
+			policyDef,
+			argv,
+			options.Cwd,
+			scope,
+			options.AdminApproved,
+			options.Stdin,
+			registry,
+		)
+		if err != nil {
+			return Result{}, fmt.Errorf("evaluate post policy %q: %w", policyID, err)
+		}
+
+		decisions = append(decisions, evaluated...)
+	}
+
+	return Result{
+		Argv:      argv,
+		Operation: operation,
+		Status:    resultStatus(decisions),
+		Decisions: decisions,
+	}, nil
+}
+
+type ExitCodeError struct {
+	Code int
+}
+
+func (err ExitCodeError) Error() string {
+	return fmt.Sprintf("git exited with status %d", err.Code)
+}
+
+func (err ExitCodeError) ExitCode() int {
+	return err.Code
+}

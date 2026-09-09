@@ -1,0 +1,486 @@
+// SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package evaluators
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/ethosure/coding_ethos/go/diagnostics"
+	"github.com/ethosure/coding_ethos/go/internal/policy"
+	"github.com/ethosure/coding_ethos/go/internal/shellparse"
+)
+
+var (
+	errShellHelperWorkingDirectoryRequired = errors.New(
+		"inspect tracked common shell helpers: repository working directory is required",
+	)
+	errShellHelperPrefixOutsideRepository = errors.New("is outside the repository")
+	shellStrictModePattern                = regexp.MustCompile(
+		`(?m)^\s*set\s+-[euo]+\s*pipefail|^\s*set\s+-euo\s+pipefail`,
+	)
+	shellCommonSourcePattern = regexp.MustCompile(
+		`(?m)source\s+.*common\.sh|^\.\s+.*common\.sh`,
+	)
+)
+
+type shellViolation struct {
+	Message string
+	Line    int
+	Column  int
+}
+
+func EvaluateShellBestPractices(
+	policyDef policy.Policy,
+	context Context,
+) ([]policy.Decision, error) {
+	if len(context.Files) == 0 {
+		return nil, nil
+	}
+
+	shellFiles := shellFilesFrom(context.Files)
+	if len(shellFiles) == 0 {
+		return nil, nil
+	}
+
+	repositoryRoot, requireCommon, err := resolveCommonShellHelperPrefixes(context)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, file := range shellFiles {
+		text, skip, err := readShellText(file)
+		if err != nil {
+			return nil, err
+		}
+
+		if skip {
+			continue
+		}
+
+		comparisonPath, err := commonShellHelperComparisonPath(repositoryRoot, file)
+		if err != nil {
+			return nil, err
+		}
+
+		violations := shellBestPracticeViolations(
+			comparisonPath,
+			text,
+			requireCommon,
+		)
+		if len(violations) > 0 {
+			return []policy.Decision{
+				shellBestPracticesDecision(policyDef, file, violations),
+			}, nil
+		}
+	}
+
+	return nil, nil
+}
+
+func shellFilesFrom(files []string) []string {
+	shellFiles := make([]string, 0, len(files))
+	for _, file := range files {
+		if looksLikeShellFile(file) {
+			shellFiles = append(shellFiles, file)
+		}
+	}
+
+	return shellFiles
+}
+
+// resolveCommonShellHelperPrefixes resolves the repository root and the
+// directory prefixes that must source a tracked common shell helper. The
+// returned prefixes are empty when the repository tracks no such helper.
+func resolveCommonShellHelperPrefixes(
+	context Context,
+) (string, []string, error) {
+	if strings.TrimSpace(context.Cwd) == "" {
+		return "", nil, errShellHelperWorkingDirectoryRequired
+	}
+
+	repositoryRoot, err := gitWorktreeRoot(context.Cwd)
+	if err != nil {
+		return "", nil, fmt.Errorf(
+			"resolve repository root for common shell helpers: %w",
+			err,
+		)
+	}
+
+	requireCommon := stringSliceOption(
+		context.EvaluatorOptions,
+		"require_common_for_prefixes",
+		[]string{"scripts/"},
+	)
+
+	helperPaths, err := configuredCommonShellHelperPaths(
+		repositoryRoot,
+		requireCommon,
+	)
+	if err != nil {
+		return "", nil, err
+	}
+
+	hasCommonHelper, err := repositoryHasTrackedCommonShellHelper(
+		repositoryRoot,
+		helperPaths,
+	)
+	if err != nil {
+		return "", nil, err
+	}
+
+	if !hasCommonHelper {
+		return repositoryRoot, nil, nil
+	}
+
+	return repositoryRoot, commonShellHelperPrefixes(helperPaths), nil
+}
+
+func repositoryHasTrackedCommonShellHelper(
+	repositoryRoot string,
+	helperPaths []string,
+) (bool, error) {
+	if len(helperPaths) == 0 {
+		return false, nil
+	}
+
+	args := []string{"ls-files", "--cached", "--"}
+	for _, helperPath := range helperPaths {
+		args = append(args, ":(literal)"+helperPath)
+	}
+
+	output, err := GitCommand(repositoryRoot, args...).CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf(
+			"inspect tracked common shell helpers with git ls-files: %w: %s",
+			err,
+			strings.TrimSpace(string(output)),
+		)
+	}
+
+	configuredHelpers := stringSet(helperPaths)
+
+	for line := range strings.SplitSeq(string(output), "\n") {
+		trackedPath := filepath.ToSlash(strings.TrimSpace(line))
+		if configuredHelpers[trackedPath] {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func commonShellHelperPrefixes(helperPaths []string) []string {
+	prefixes := make([]string, 0, len(helperPaths))
+	for _, helperPath := range helperPaths {
+		prefix := filepath.ToSlash(filepath.Dir(helperPath))
+		if prefix != "." {
+			prefix += "/"
+		}
+
+		prefixes = append(prefixes, prefix)
+	}
+
+	return prefixes
+}
+
+func commonShellHelperComparisonPath(repositoryRoot, path string) (string, error) {
+	if !filepath.IsAbs(path) {
+		return filepath.ToSlash(filepath.Clean(path)), nil
+	}
+
+	normalizedRoot, err := filepath.EvalSymlinks(repositoryRoot)
+	if err != nil {
+		return "", fmt.Errorf("normalize common shell helper repository root: %w", err)
+	}
+
+	normalizedPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("normalize shell file path %q: %w", path, err)
+	}
+
+	relativePath, err := filepath.Rel(normalizedRoot, normalizedPath)
+	if err != nil {
+		return "", fmt.Errorf(
+			"resolve shell file path %q from repository root: %w",
+			path,
+			err,
+		)
+	}
+
+	return filepath.ToSlash(relativePath), nil
+}
+
+func configuredCommonShellHelperPaths(
+	repositoryRoot string,
+	prefixes []string,
+) ([]string, error) {
+	normalizedRepositoryRoot, err := filepath.Abs(repositoryRoot)
+	if err != nil {
+		return nil, fmt.Errorf("resolve common shell helper repository root: %w", err)
+	}
+
+	normalizedRepositoryRoot, err = filepath.EvalSymlinks(
+		normalizedRepositoryRoot,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("normalize common shell helper repository root: %w", err)
+	}
+
+	helperPaths := make([]string, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		trimmed := strings.TrimSpace(prefix)
+		if trimmed == "" {
+			continue
+		}
+
+		cleaned := filepath.Clean(trimmed)
+		if filepath.IsAbs(cleaned) {
+			cleaned, err = filepath.EvalSymlinks(cleaned)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"normalize common shell helper prefix %q: %w",
+					prefix,
+					err,
+				)
+			}
+
+			cleaned, err = filepath.Rel(normalizedRepositoryRoot, cleaned)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"resolve common shell helper prefix %q: %w",
+					prefix,
+					err,
+				)
+			}
+		}
+
+		if cleaned == ".." || strings.HasPrefix(
+			cleaned,
+			".."+string(filepath.Separator),
+		) {
+			return nil, fmt.Errorf(
+				"common shell helper prefix %q %w",
+				prefix,
+				errShellHelperPrefixOutsideRepository,
+			)
+		}
+
+		helperPaths = append(
+			helperPaths,
+			filepath.ToSlash(filepath.Join(cleaned, "common.sh")),
+		)
+	}
+
+	return helperPaths, nil
+}
+
+func looksLikeShellFile(path string) bool {
+	base := filepath.Base(path)
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".sh", ".bash", ".zsh":
+		return true
+	default:
+		return base == "bashrc" || base == "zshrc"
+	}
+}
+
+// readShellText returns the file's text and a skip flag. Skip is true when the
+// file must not be evaluated at all: a binary file, or a path deleted by the
+// edit under review. A deleted path must be skipped rather than reported as an
+// empty file that violates every shell convention.
+func readShellText(path string) (string, bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", true, nil
+		}
+
+		return "", false, fmt.Errorf("read shell file %s: %w", path, err)
+	}
+
+	if !utf8.Valid(data) || bytes.Contains(data, []byte{0}) {
+		return "", true, nil
+	}
+
+	return string(data), false, nil
+}
+
+func shellBestPracticeViolations(
+	path string,
+	text string,
+	requireCommonForPrefixes []string,
+) []shellViolation {
+	violations := []shellViolation{}
+	violations = append(
+		violations,
+		shellHeaderViolations(path, text, requireCommonForPrefixes)...)
+
+	commands, err := shellparse.Commands(text)
+	if err != nil {
+		return append(violations, shellParseViolation(err))
+	}
+
+	for _, command := range commands {
+		violations = append(violations, shellCommandViolations(command)...)
+	}
+
+	return violations
+}
+
+func shellHeaderViolations(
+	path string,
+	text string,
+	requireCommonForPrefixes []string,
+) []shellViolation {
+	violations := []shellViolation{}
+	if !validShellShebang(text) {
+		violations = append(violations, shellViolation{
+			Message: "missing or invalid shell shebang",
+			Line:    1,
+			Column:  1,
+		})
+	}
+
+	if !shellStrictModePattern.MatchString(text) {
+		violations = append(violations, shellViolation{
+			Message: "missing 'set -euo pipefail'",
+			Line:    1,
+			Column:  1,
+		})
+	}
+
+	if hasConfiguredPrefix(path, requireCommonForPrefixes) &&
+		!shellCommonSourcePattern.MatchString(text) {
+		violations = append(violations, shellViolation{
+			Message: "scripts/ shell files must source the repository common shell helpers",
+			Line:    1,
+			Column:  1,
+		})
+	}
+
+	return violations
+}
+
+func shellParseViolation(err error) shellViolation {
+	violation := shellViolation{
+		Message: "shell script has invalid shell syntax",
+		Line:    1,
+		Column:  1,
+	}
+
+	var parseErr shellparse.Error
+	if errors.As(err, &parseErr) {
+		violation.Line = parseErr.Line
+		violation.Column = parseErr.Column
+	}
+
+	return violation
+}
+
+func shellCommandViolations(command shellparse.Command) []shellViolation {
+	violations := []shellViolation{}
+	if command.Name == "eval" {
+		violations = append(violations, shellViolation{
+			Message: "shell scripts must not use eval",
+			Line:    command.Line,
+			Column:  command.Column,
+		})
+	}
+
+	if command.IsFunctionDeclaration &&
+		(command.Name == "git" || command.Name == "ruff" || command.Name == "mypy") {
+		violations = append(violations, shellViolation{
+			Message: "shell functions must not mask protected tool names",
+			Line:    command.Line,
+			Column:  command.Column,
+		})
+	}
+
+	return violations
+}
+
+func validShellShebang(text string) bool {
+	reader := strings.NewReader(text)
+
+	line, err := readFirstLine(reader)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false
+	}
+
+	return strings.HasPrefix(line, "#!/usr/bin/env bash") ||
+		strings.HasPrefix(line, "#!/bin/bash") ||
+		strings.HasPrefix(line, "#!/usr/bin/env sh") ||
+		strings.HasPrefix(line, "#!/bin/sh")
+}
+
+func readFirstLine(reader *strings.Reader) (string, error) {
+	var builder strings.Builder
+
+	for {
+		char, _, err := reader.ReadRune()
+		if err != nil {
+			return builder.String(), err
+		}
+
+		if char == '\n' {
+			return builder.String(), nil
+		}
+
+		builder.WriteRune(char)
+	}
+}
+
+func hasConfiguredPrefix(path string, prefixes []string) bool {
+	normalized := filepath.ToSlash(path)
+
+	normalized = strings.TrimPrefix(normalized, "./")
+	for _, prefix := range prefixes {
+		cleaned := strings.TrimPrefix(filepath.ToSlash(prefix), "./")
+		if cleaned != "" && strings.HasPrefix(normalized, cleaned) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func shellBestPracticesDecision(
+	policyDef policy.Policy,
+	file string,
+	violations []shellViolation,
+) policy.Decision {
+	decision := policy.NewDecision(blockDecision, policyDef)
+	diagnosticItems := make([]diagnostics.Diagnostic, 0, len(violations))
+
+	messages := make([]string, 0, len(violations))
+	for _, violation := range violations {
+		messages = append(messages, violation.Message)
+		diagnosticItems = append(diagnosticItems, diagnostics.Diagnostic{
+			Tool:     "shell_best_practices",
+			File:     file,
+			Line:     violation.Line,
+			Column:   violation.Column,
+			Severity: blockDecision,
+			PolicyID: policyDef.ID,
+			Message:  violation.Message,
+			Advice:   policyDef.Suggestion,
+		})
+	}
+
+	decision.Diagnostics = diagnosticItems
+	decision.Evidence = map[string]any{
+		"file":       file,
+		"violations": messages,
+	}
+
+	return decision
+}

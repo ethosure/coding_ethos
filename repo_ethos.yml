@@ -1,0 +1,497 @@
+# SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+repo:
+  name: coding-ethos
+  overview: Python CLI plus bundled ETHOS enforcement package for generating ETHOS.md,
+    AGENTS.md, CLAUDE.md, GEMINI.md, and supporting agent context files from a shared
+    YAML ethos plus an optional repo-specific overlay.
+  commands:
+    install:
+      - make install
+    status:
+      - make status
+    test:
+      - make test
+    check:
+      - make check
+    validate:
+      - make validate
+    pre-commit:
+      - make pre-commit
+    install-hooks:
+      - make install-hooks
+    pre-push:
+      - make pre-push
+    go-test:
+      - make go-test
+    sync-tool-configs:
+      - make sync-tool-configs
+    check-tool-configs:
+      - make check-tool-configs
+    sync-gemini-prompts:
+      - make sync-gemini-prompts
+    check-gemini-prompts:
+      - make check-gemini-prompts
+    pre-commit-all:
+      - make pre-commit-all
+    generate:
+      - make generate
+    merge-existing:
+      - make generate-merge
+    help:
+      - make help
+  paths:
+    makefile: Makefile
+    source: coding_ethos/
+    cli: coding_ethos/cli.py
+    loaders: coding_ethos/loaders.py
+    renderers: coding_ethos/renderers.py
+    markdown_seed: coding_ethos/markdown_seed.py
+    merge_logic: coding_ethos/merging.py
+    gemini_prompt_pack: go/internal/geminiprompts/
+    presets: coding_ethos/presets.py
+    models: coding_ethos/models.py
+    tests: tests/test_cli.py
+    primary_ethos: coding_ethos.yml
+    repo_overlay: repo_ethos.yml
+    overlay_example: repo_ethos.example.yml
+    bundle_config: config.yaml
+    consumer_override_example: repo_config.example.yaml
+    precommit_bundle: pre-commit/
+    go_hook_runner: go/cmd/coding-ethos-hook-runner/
+  notes:
+    - coding_ethos.yml is the shared source contract; repo_ethos.yml is the repo-local
+      refinement layer.
+    - config.yaml is the bundle-wide enforcement source of truth; consuming repos refine
+      it with repo_config.yaml-style overrides at their own repo root.
+    - The Makefile is the preferred repo-local operator interface for generation,
+      generated repo-root tool configs, the generated Gemini prompt pack, and bundled
+      Go hook workflows.
+    - The bundled ETHOS pre-commit enforcement package lives under pre-commit/ and
+      installs direct Go runner shims into `.git/hooks/`.
+    - style.python_version is the single Python-version authority across generated tool
+      configs, the pyupgrade autofix pass, and repo-root consistency checks for
+      .python-version, pyproject.toml, mypy.ini, pyrightconfig.json, ruff.toml, and
+      .golangci.yml's lll line-length setting.
+    - Hook runtime, policy enforcement, Python policy checks, and bundled analyzer
+      orchestration now live in go/cmd/coding-ethos-hook-runner/ inside the shared
+      Go module; pre-commit/hooks/ contains hook assets and narrow bootstrap shims.
+    - Source-aware enforcement follows the AST/CEL/SARIF architecture documented
+      in docs/AST_CEL_SARIF_ARCHITECTURE.md. Extend shared Go Tree-sitter fact
+      collection first, express configurable decisions in CEL where possible,
+      and let SARIF carry stable AST identity and remediation metadata. Do not add
+      ad hoc text scanners or policy-specific AST walkers before checking this path.
+    - If you fix hook, policy, lint-capture, runtime, generated-config, or parent
+      integration behavior, run `make build` before claiming the bug is fixed.
+      Without rebuilding, the parent repo can keep executing stale runtime
+      binaries and configs, which means the fix has not actually landed for agents.
+    - Prefer replacing shell and Python implementation glue with Go wherever
+      practical. Every branch should identify at least one related shell or Python
+      path that can move into compiled Go, even if the branch only documents why
+      it is not the right time to migrate it.
+    - The CLI should stay thin. Most behavior belongs in loaders, renderers, markdown
+      seeding, and merge helpers.
+    - Gemini prompt authoring now lives under pre-commit/prompts/ as Jinja templates;
+      the active Go runner should consume generated prompt packs instead of duplicating
+      prompt text in code.
+    - When flags, output layout, merge behavior, or overlay semantics change, update
+      README.md, repo_ethos.example.yml, and tests/test_cli.py in the same change.
+    - This repo currently exposes `make check` as its canonical automated verification
+      gate; use `make test` or `uv run pytest` only as focused Python-test helpers.
+agent_notes:
+  codex:
+    - Prefer changing the narrow module that owns the behavior instead of spreading
+      logic across cli.py and multiple helpers.
+    - After changing coding_ethos.yml, repo_ethos.yml, or renderer behavior, regenerate
+      this repo's checked-in agent files before finishing.
+    - Treat generated markdown files as derived artifacts; hand-edit them only when the
+      task is explicitly about the generated output itself.
+    - On each branch, look for one related shell or Python implementation path that
+      can be moved into Go, and either migrate it or record the concrete blocker.
+    - >-
+      For source-aware policy, use docs/AST_CEL_SARIF_ARCHITECTURE.md first:
+      Go collects AST facts, CEL decides configurable policy, and SARIF
+      reports stable findings.
+    - After fixing hook, policy, lint-capture, runtime, generated-config, or parent
+      integration behavior, run `make build`; otherwise parent-repo agents may still
+      execute stale binaries or configs.
+  claude:
+    - Open the matching detail doc before changing output structure, merge rules, or
+      YAML validation behavior.
+    - Use CLAUDE.md as a thin import hub; keep repo-specific operational detail in the
+      shared generated docs.
+    - Prefer compiled Go for hook, policy, lint-capture, and runtime glue; treat
+      shell and Python as transitional unless they are clearly the right interface.
+    - >-
+      For source-aware policy, read docs/AST_CEL_SARIF_ARCHITECTURE.md before
+      adding new checks; extend AST facts first and avoid ad hoc scanners.
+    - Run `make build` after hook, policy, lint-capture, runtime, generated-config,
+      or parent integration fixes so installed parent-runtime artifacts are refreshed.
+  gemini:
+    - Prefer targeted reads of the module that owns the behavior rather than summarizing
+      the whole repo at once.
+    - When discussing generated outputs, anchor the explanation in the source YAML and
+      renderer pipeline.
+    - Include a shell/Python-to-Go migration opportunity in branch analysis when the
+      work touches hooks, policy, linting, or runtime orchestration.
+    - >-
+      For source-aware policy, follow docs/AST_CEL_SARIF_ARCHITECTURE.md: Go
+      facts, CEL decisions, SARIF findings.
+    - Run `make build` after fixing hook, policy, lint-capture, runtime,
+      generated-config, or parent integration behavior; tests alone do not refresh
+      the parent repo runtime.
+principles:
+  overrides:
+    static-analysis-is-the-first-line-of-defense:
+      append: |-
+        This repo currently documents `make check` as its canonical automated
+        gate.
+
+        Focused commands such as `make test` or `uv run pytest` are useful
+        during development, but release and review readiness must use the
+        documented Makefile gate instead of a local preference.
+
+        This repo exists to bring consistent policy, settings, and linters to
+        diverse consuming repos. Treat each consuming repo as an untrusted
+        execution target: its binaries, `PATH`, aliases, shell state,
+        `pyproject.toml`, `uv` project state, and same-named tool config files
+        are minefields, not sources of authority.
+
+        Captured lint commands must run coding-ethos-managed tool versions from
+        the controlled hook project, with explicit coding-ethos-generated config
+        flags. Resolve the caller's target paths and globs first, then execute
+        the managed linter with those resolved targets. Do not execute the
+        parent repo's linter binary or inherit its config discovery.
+
+        Generated linter configs are part of the enforcement boundary. If a
+        generated config or its hash manifest drifts, fail before invoking any
+        linter and tell the caller to restore the generated files before
+        continuing.
+    one-path-for-critical-operations:
+      append: |-
+        Keep generation routed through `coding_ethos.cli.main()` and the
+        shared
+        rendering pipeline instead of adding ad hoc writers for individual
+        root
+        files.
+
+        If output behavior changes, update the source YAML, renderer logic,
+        and
+        tests together rather than patching only one layer.
+      policy:
+        expressions:
+          - id: coding_ethos.feedback_route
+            description: >-
+              Coding Ethos feedback and agent-facing communication must route
+              through the central feedback package instead of ad hoc stream
+              writes.
+            scope: file
+            severity: block
+            mode: block
+            protected: true
+            allow_override: false
+            allow_severity_weaken: false
+            hook_events:
+              - PreToolUse
+            tools:
+              - Write
+              - Edit
+              - MultiEdit
+            lint_scopes:
+              - staged
+              - files
+            principle_ids:
+              - one-path-for-critical-operations
+              - protocol-first-design
+            skill_id: agent-operating-discipline
+            message: Feedback output must route through go/internal/feedback.
+            advice: >-
+              Model the message as a feedback.Payload and render it through
+              feedback.Render or feedback.Write so JSON, TOON, human, SARIF,
+              and structured logging stay consistent.
+            when: >-
+              diff.added_lines.exists(line,
+                has_prefix(line.file, "go/internal/") &&
+                has_suffix(line.file, ".go") &&
+                !has_suffix(line.file, "_test.go") &&
+                !has_prefix(line.file, "go/internal/feedback/") &&
+                (
+                  line.text.contains("fmt.Fprint") ||
+                  line.text.contains("fmt.Fprintf") ||
+                  line.text.contains("fmt.Print") ||
+                  line.text.contains("fmt.Printf") ||
+                  line.text.contains("io.WriteString") ||
+                  line.text.contains("os.Stdout.Write") ||
+                  line.text.contains("os.Stdout.WriteString") ||
+                  line.text.contains("os.Stderr.Write") ||
+                  line.text.contains("os.Stderr.WriteString") ||
+                  line.text.contains("format: toon")
+                )
+              )
+    documentation-as-contract:
+      append: |-
+        In this repo, documentation is part of the product surface.
+
+        If CLI flags, output filenames, import conventions, or generated
+        directory
+        layout changes, update `README.md` and the checked-in generated
+        outputs in
+        the same change.
+    testing-as-specification:
+      append: |-
+        `tests/test_cli.py` is the executable contract for rendering coverage,
+        inject-mode merges, symlink replacement, and LLM merge dispatch.
+
+        Extend the tests whenever output structure, merge semantics, or CLI
+        flow
+        changes.
+      policy:
+        expressions:
+          - id: testing.go_coverage_floor
+            description: >-
+              Block coding-ethos commits and pushes when managed go-test
+              total suite coverage drops below the project floor.
+            scope: lint
+            severity: block
+            mode: block
+            protected: true
+            allow_override: false
+            allow_severity_weaken: false
+            tools:
+              - go-test
+            lint_scopes:
+              - files
+              - staged
+            principle_ids:
+              - testing-as-specification
+              - functional-testing-is-the-proof
+            skill_id: lint-remediation
+            coverage_thresholds:
+              project:
+                high: 90.0
+                medium: 80.0
+                low: 0.0
+                floor: 80.0
+                goal: 90.0
+              package:
+                high: 90.0
+                medium: 0.0
+                low: 0.0
+                floor: 0.0
+                goal: 90.0
+              file:
+                high: 90.0
+                medium: 0.0
+                low: 0.0
+                floor: 0.0
+                goal: 90.0
+              function:
+                high: 90.0
+                medium: 0.0
+                low: 0.0
+                floor: 0.0
+                goal: 90.0
+            when: >-
+              coverage.exists(item,
+                item.tool == "go-test" &&
+                ((item.total &&
+                item.percent < coverage_thresholds.project.floor) ||
+                (item.code == "coverage-package" &&
+                coverage_thresholds.package.floor > 0.0 &&
+                item.percent < coverage_thresholds.package.floor) ||
+                (item.code == "coverage-file" &&
+                coverage_thresholds.file.floor > 0.0 &&
+                item.percent < coverage_thresholds.file.floor)) &&
+                (item.package == "" ||
+                item.package.startsWith("github.com/ethosure/coding_ethos/go"))
+              )
+            message: Go test coverage is below the required 80% floor.
+            advice: >-
+              Add meaningful tests or refactor under-tested code before
+              committing or pushing; do not weaken the coverage gate.
+          - id: testing.go_coverage_goal
+            description: >-
+              Warn when managed go-test total suite or per-file coverage is
+              below the coding-ethos 90% quality goal.
+            scope: lint
+            severity: warn
+            mode: warn
+            protected: true
+            allow_override: false
+            allow_severity_weaken: false
+            tools:
+              - go-test
+            lint_scopes:
+              - files
+              - staged
+            principle_ids:
+              - testing-as-specification
+              - functional-testing-is-the-proof
+            skill_id: lint-remediation
+            coverage_thresholds:
+              project:
+                high: 90.0
+                medium: 80.0
+                low: 0.0
+                floor: 80.0
+                goal: 90.0
+              package:
+                high: 90.0
+                medium: 0.0
+                low: 0.0
+                floor: 0.0
+                goal: 90.0
+              file:
+                high: 90.0
+                medium: 0.0
+                low: 0.0
+                floor: 0.0
+                goal: 90.0
+              function:
+                high: 90.0
+                medium: 0.0
+                low: 0.0
+                floor: 0.0
+                goal: 90.0
+            when: >-
+              coverage.exists(item,
+                item.tool == "go-test" &&
+                ((item.total &&
+                item.percent < coverage_thresholds.project.goal) ||
+                (item.code == "coverage-package" &&
+                item.percent < coverage_thresholds.package.goal) ||
+                (item.code == "coverage-file" &&
+                item.percent < coverage_thresholds.file.goal)) &&
+                (item.package == "" ||
+                item.package.startsWith("github.com/ethosure/coding_ethos/go"))
+              )
+            message: Go test coverage is below the 90% project goal.
+            advice: >-
+              Add meaningful total-suite and per-file Go coverage; warnings
+              are visible review feedback even when the 80% blocking floor
+              still passes.
+  additional:
+    - id: generated-files-are-derived-artifacts
+      order: 900
+      title: Generated Files Are Derived Artifacts
+      summary: Root agent files in this repository are generated outputs, not the
+        primary authoring surface.
+      directive: Edit the source ethos or renderer code first, then regenerate the
+        checked-in agent files.
+      tags:
+        - documentation
+        - workflow
+        - testing
+      related:
+        - documentation-as-contract
+        - one-path-for-critical-operations
+        - testing-as-specification
+      quick_ref:
+        - Treat coding_ethos.yml and repo_ethos.yml as the source inputs for checked-in
+          agent docs.
+        - Regenerate AGENTS.md, CLAUDE.md, GEMINI.md, ETHOS.md, and supporting docs
+          after changing ethos inputs or renderers.
+        - Review generated diffs instead of hand-editing derived markdown files.
+      merge_topics:
+        - generated file workflow
+        - derived artifact policy
+        - regeneration discipline
+      agent_hints:
+        codex: Prefer changing source YAML or renderer logic over hand-editing generated
+          markdown outputs.
+        claude: Check whether a requested doc edit belongs in the source ethos files
+          before editing generated docs directly.
+        gemini: Summarize generated-file changes in terms of source inputs and
+          regeneration, not manual markdown edits.
+      policy:
+        expressions:
+          - id: filesystem.generated_artifact_edit
+            scope: file
+            severity: block
+            mode: block
+            skill_id: agent-operating-discipline
+            lint_scopes:
+              - staged
+            tools:
+              - Write
+              - Edit
+              - MultiEdit
+            message: Generated artifacts must be changed through their source inputs.
+            advice: >-
+              Edit coding_ethos.yml, repo_ethos.yml, or renderer code, then
+              regenerate and review the generated diff.
+            when: >-
+              (
+                list_contains(["Write", "Edit", "MultiEdit"], event.tool) &&
+                paths.exists(path,
+                  any_glob_match(
+                    [
+                      "AGENTS.md",
+                      "CLAUDE.md",
+                      "GEMINI.md",
+                      "ETHOS.md",
+                      ".agents/ethos/**",
+                      ".claude/ethos/**",
+                      ".agent-context/prompt-addons/**",
+                      ".coding-ethos/gemini/prompt-pack.json"
+                    ],
+                    path.file
+                  )
+                )
+              ) ||
+              (
+                file_changes.exists(file,
+                  any_glob_match(
+                    [
+                      "AGENTS.md",
+                      "CLAUDE.md",
+                      "GEMINI.md",
+                      "ETHOS.md",
+                      ".agents/ethos/**",
+                      ".claude/ethos/**",
+                      ".agent-context/prompt-addons/**",
+                      ".coding-ethos/gemini/prompt-pack.json"
+                    ],
+                    file.file
+                  )
+                ) &&
+                !file_changes.exists(file,
+                  any_glob_match(
+                    [
+                      "coding_ethos.yml",
+                      "repo_ethos.yml",
+                      "coding_ethos/**",
+                      "tests/test_cli.py"
+                    ],
+                    file.file
+                  )
+                )
+              )
+      sections:
+        - id: overview
+          kind: overview
+          title: Overview
+          summary: Root agent files in this repo are generated artifacts.
+          body: |-
+            `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `ETHOS.md`,
+            `.claude/ethos/MEMORY.md`, `.agents/ethos/*`, and
+            `.agent-context/prompt-addons/*` are generated artifacts in this
+            repository.
+
+            When requested behavior changes, prefer updating `coding_ethos.yml`,
+            `repo_ethos.yml`, or the renderer and loader code that defines the
+            output
+            shape, then regenerate the files and review the diff.
+        - id: workflow
+          kind: workflow
+          title: Workflow
+          summary: Change source inputs first, then regenerate and verify.
+          body: |-
+            For repo-local guidance changes, edit `repo_ethos.yml`. For shared
+            contract
+            changes, edit `coding_ethos.yml`. For output shape changes, edit the
+            renderer or loader code and update tests.
+
+            After any of those changes, regenerate the repo outputs with `make
+            generate` and run `make check`.

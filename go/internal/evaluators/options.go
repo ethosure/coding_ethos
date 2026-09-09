@@ -1,0 +1,98 @@
+// SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package evaluators
+
+import "strings"
+
+func intOption(options map[string]any, key string, defaultValue int) int {
+	raw, exists := options[key]
+	if !exists {
+		return defaultValue
+	}
+
+	switch typed := raw.(type) {
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	default:
+		return defaultValue
+	}
+}
+
+func stringOption(options map[string]any, key, defaultValue string) string {
+	raw, exists := options[key]
+	if !exists {
+		return defaultValue
+	}
+
+	value, isString := raw.(string)
+	if !isString {
+		return defaultValue
+	}
+
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return defaultValue
+	}
+
+	return value
+}
+
+func stringSliceOption(
+	options map[string]any,
+	key string,
+	defaults []string,
+) []string {
+	raw, exists := options[key]
+	if !exists {
+		return append([]string(nil), defaults...)
+	}
+
+	rawStringItems, isStringSlice := raw.([]string)
+	if isStringSlice {
+		items := make([]string, 0, len(rawStringItems))
+		for _, item := range rawStringItems {
+			if item != "" {
+				items = append(items, item)
+			}
+		}
+
+		if len(items) > 0 {
+			return items
+		}
+
+		return append([]string(nil), defaults...)
+	}
+
+	rawItems, ok := raw.([]any)
+	if !ok {
+		return append([]string(nil), defaults...)
+	}
+
+	items := make([]string, 0, len(rawItems))
+	for _, rawItem := range rawItems {
+		item, ok := rawItem.(string)
+		if ok && item != "" {
+			items = append(items, item)
+		}
+	}
+
+	if len(items) == 0 {
+		return append([]string(nil), defaults...)
+	}
+
+	return items
+}
+
+func stringSet(items []string) map[string]bool {
+	set := make(map[string]bool, len(items))
+	for _, item := range items {
+		set[item] = true
+	}
+
+	return set
+}

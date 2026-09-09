@@ -1,0 +1,239 @@
+// SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package agenthooks
+
+import (
+	"fmt"
+
+	"github.com/ethosure/coding_ethos/go/internal/syncstate"
+)
+
+func StateArtifacts(root, hookCommand string) ([]syncstate.Artifact, error) {
+	return StateArtifactsWithMCPCommand(root, hookCommand, "")
+}
+
+// StateArtifactsWithMCPCommand renders hook settings while keeping Coding
+// Ethos MCP ownership independent from an external supervisor hook command.
+func StateArtifactsWithMCPCommand(
+	root string,
+	hookCommand string,
+	mcpCommand string,
+) ([]syncstate.Artifact, error) {
+	return StateArtifactsForRootsWithMCPCommand(
+		root,
+		root,
+		root,
+		hookCommand,
+		mcpCommand,
+	)
+}
+
+// StateArtifactsForRootsWithMCPCommand renders settings that keep generated
+// provider configuration, repository inspection, and durable state separate.
+func StateArtifactsForRootsWithMCPCommand(
+	settingsRoot string,
+	repoRoot string,
+	stateRoot string,
+	hookCommand string,
+	mcpCommand string,
+) ([]syncstate.Artifact, error) {
+	return StateArtifactsForRootsWithMCPCommandAndOptions(
+		settingsRoot,
+		repoRoot,
+		stateRoot,
+		hookCommand,
+		mcpCommand,
+		DefaultSettingsOptions(),
+	)
+}
+
+// StateArtifactsForRootsWithMCPCommandAndOptions renders the exact provider
+// settings selected by the hook deadline.
+func StateArtifactsForRootsWithMCPCommandAndOptions(
+	settingsRoot string,
+	repoRoot string,
+	stateRoot string,
+	hookCommand string,
+	mcpCommand string,
+	options SettingsOptions,
+) ([]syncstate.Artifact, error) {
+	settings, err := buildAllSettings(hookCommand, options)
+	if err != nil {
+		return nil, err
+	}
+
+	serverConfig, err := mcpServerConfigForRoots(
+		hookCommand,
+		mcpCommand,
+		settingsRoot,
+		repoRoot,
+		stateRoot,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	inputs, err := renderProviderStateArtifactInputs(
+		settingsRoot,
+		settings,
+		serverConfig,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	artifacts, err := syncstate.Artifacts(settingsRoot, inputs)
+	if err != nil {
+		return nil, fmt.Errorf("build agent hook state artifacts: %w", err)
+	}
+
+	return artifacts, nil
+}
+
+func renderProviderStateArtifactInputs(
+	settingsRoot string,
+	settings allSettings,
+	serverConfig mcpServer,
+) ([]syncstate.ArtifactInput, error) {
+	paths := DefaultSettingsPaths(settingsRoot)
+
+	claude, err := renderSettingsFileContent(paths.Claude, func(payload map[string]any) {
+		payload["hooks"] = settings.Claude.Hooks
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	claudeMCP, err := renderSettingsFileContent(
+		paths.ClaudeMCP,
+		func(payload map[string]any) {
+			syncMCPServers(payload, serverConfig.claudeJSON())
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	codex, err := renderTextSettingsFileContent(
+		paths.CodexConfig,
+		func(content string) string {
+			return ensureCodexConfig(content, settings.Codex, serverConfig)
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	gemini, err := renderSettingsFileContent(paths.Gemini, func(payload map[string]any) {
+		payload["hooksConfig"] = settings.Gemini.HooksConfig
+		payload["hooks"] = settings.Gemini.Hooks
+		syncMCPServers(payload, serverConfig.geminiJSON())
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	kimiConfig, kimiMCP, err := renderKimiStateArtifacts(paths, settings, serverConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	return agentHookStateArtifactInputs(
+		paths,
+		providerStateContent{
+			claude:     claude,
+			claudeMCP:  claudeMCP,
+			codex:      codex,
+			gemini:     gemini,
+			kimiConfig: kimiConfig,
+			kimiMCP:    kimiMCP,
+		},
+	), nil
+}
+
+func renderKimiStateArtifacts(
+	paths SettingsPaths,
+	settings allSettings,
+	serverConfig mcpServer,
+) (string, string, error) {
+	config, err := renderTextSettingsFileContent(
+		paths.KimiConfig,
+		func(content string) string {
+			return ensureKimiConfig(content, settings.Kimi)
+		},
+	)
+	if err != nil {
+		return "", "", err
+	}
+
+	mcp, err := renderSettingsFileContent(paths.KimiMCP, func(payload map[string]any) {
+		syncMCPServers(payload, serverConfig.geminiJSON())
+	})
+	if err != nil {
+		return "", "", err
+	}
+
+	return config, mcp, nil
+}
+
+type providerStateContent struct {
+	claude     string
+	claudeMCP  string
+	codex      string
+	gemini     string
+	kimiConfig string
+	kimiMCP    string
+}
+
+func agentHookStateArtifactInputs(
+	paths SettingsPaths,
+	content providerStateContent,
+) []syncstate.ArtifactInput {
+	const verifyCommand = "bin/coding-ethos-run agent-hooks doctor"
+
+	return []syncstate.ArtifactInput{
+		{
+			RelativePath:        paths.Claude,
+			Content:             content.claude,
+			Provider:            "agent-hooks",
+			Surface:             "claude-settings",
+			VerificationCommand: verifyCommand,
+		},
+		{
+			RelativePath:        paths.ClaudeMCP,
+			Content:             content.claudeMCP,
+			Provider:            "agent-hooks",
+			Surface:             "claude-mcp",
+			VerificationCommand: verifyCommand,
+		},
+		{
+			RelativePath:        paths.CodexConfig,
+			Content:             content.codex,
+			Provider:            "agent-hooks",
+			Surface:             "codex-config",
+			VerificationCommand: verifyCommand,
+		},
+		{
+			RelativePath:        paths.Gemini,
+			Content:             content.gemini,
+			Provider:            "agent-hooks",
+			Surface:             "gemini-settings",
+			VerificationCommand: verifyCommand,
+		},
+		{
+			RelativePath:        paths.KimiConfig,
+			Content:             content.kimiConfig,
+			Provider:            "agent-hooks",
+			Surface:             "kimi-config",
+			VerificationCommand: verifyCommand,
+		},
+		{
+			RelativePath:        paths.KimiMCP,
+			Content:             content.kimiMCP,
+			Provider:            "agent-hooks",
+			Surface:             "kimi-mcp",
+			VerificationCommand: verifyCommand,
+		},
+	}
+}

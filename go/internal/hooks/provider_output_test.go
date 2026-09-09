@@ -1,0 +1,311 @@
+// SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package hooks_test
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"strings"
+	"testing"
+
+	. "github.com/ethosure/coding_ethos/go/internal/hooks"
+	"github.com/ethosure/coding_ethos/go/internal/policy"
+)
+
+func TestEncodeProviderResultMatchesCodexRemediationFixture(t *testing.T) {
+	t.Parallel()
+
+	output := encodedProviderOutput(t, `{
+		"provider": "codex",
+		"event": "PreToolUse",
+		"tool": "Bash",
+		"input": {"command": "git commit --no-verify -m test"}
+	}`)
+
+	assertJSONMatchesFixture(t, output, "testdata/provider_remediation_codex.json")
+}
+
+func TestEncodeProviderResultMatchesGeminiRemediationFixture(t *testing.T) {
+	t.Parallel()
+
+	output := encodedProviderOutput(t, `{
+		"provider": "gemini-cli",
+		"hookEventName": "BeforeTool",
+		"toolName": "run_shell_command",
+		"toolInput": {"command": "git commit --no-verify -m test"}
+	}`)
+
+	assertJSONMatchesFixture(t, output, "testdata/provider_remediation_gemini.json")
+}
+
+func TestEncodeProviderResultIncludesUpdatedInputForSupportedProviders(t *testing.T) {
+	t.Parallel()
+
+	for _, provider := range []string{"claude", "gemini-cli"} {
+		t.Run(provider, func(t *testing.T) {
+			t.Parallel()
+
+			output := encodedProviderOutput(
+				t,
+				providerGitPayload(provider, t.TempDir(), "git add file.txt"),
+			)
+
+			for _, expected := range []string{
+				`"hookSpecificOutput"`,
+				`"updatedInput"`,
+				`agent-shell --`,
+			} {
+				if !strings.Contains(output, expected) {
+					t.Fatalf("missing %q in provider output: %s", expected, output)
+				}
+			}
+		})
+	}
+}
+
+func TestEncodeProviderResultBlocksCodexUnsupportedUpdatedInput(t *testing.T) {
+	t.Parallel()
+
+	output := encodedProviderOutput(
+		t,
+		providerGitPayload("codex", t.TempDir(), "git add file.txt"),
+	)
+
+	var decoded map[string]any
+
+	err := json.Unmarshal([]byte(output), &decoded)
+	if err != nil {
+		t.Fatalf("decode output: %v", err)
+	}
+
+	if hookOutput, found := decoded["hookSpecificOutput"].(map[string]any); found {
+		if _, ok := hookOutput["updatedInput"]; ok {
+			t.Fatalf(
+				"Codex output must not include unsupported updatedInput field: %s",
+				output,
+			)
+		}
+	}
+
+	if decoded["decision"] != "block" {
+		t.Fatalf("Codex unsupported rewrite must block, got: %s", output)
+	}
+
+	reason, _ := decoded["reason"].(string)
+	if !strings.Contains(reason, "git.wrapper_required") {
+		t.Fatalf("Codex block reason must identify wrapper policy, got: %s", output)
+	}
+
+	if !strings.Contains(reason, "cerun --") {
+		t.Fatalf("Codex block reason must include cerun remediation, got: %s", output)
+	}
+}
+
+func TestEncodeProviderResultEmitsNeutralCodexPreToolUseOutput(t *testing.T) {
+	t.Parallel()
+
+	output := encodedProviderOutput(t, `{
+		"provider": "codex",
+		"event": "PreToolUse",
+		"tool": "functions.update_plan",
+		"input": {}
+	}`)
+
+	if strings.TrimSpace(output) != "{}" {
+		t.Fatalf("empty Codex PreToolUse output = %q, want neutral JSON", output)
+	}
+}
+
+func TestProviderDenialIncludesTrackingID(t *testing.T) {
+	t.Parallel()
+
+	output := encodedProviderOutput(t, `{
+		"provider": "codex",
+		"event": "PreToolUse",
+		"tool": "Bash",
+		"input": {"command": "git commit --no-verify -m test"}
+	}`)
+
+	for _, expected := range []string{
+		`"trackingID": "hook-`,
+		`"traceId": "hook-`,
+		`trackingID: hook-`,
+		`"permissionDecisionReason": "event: PreToolUse`,
+	} {
+		if !strings.Contains(output, expected) {
+			t.Fatalf("missing %q in provider output: %s", expected, output)
+		}
+	}
+}
+
+func TestEncodeProviderResultUsesKimiStopContinuationShape(t *testing.T) {
+	t.Parallel()
+
+	output := encodedProviderOutput(t, `{
+		"provider": "kimi",
+		"hook_event_name": "Stop",
+		"tool_input": {"prompt": "finish the hook implementation"}
+	}`)
+
+	for _, expected := range []string{
+		`"message": "Before ending:`,
+		`"permissionDecision": "deny"`,
+		`"permissionDecisionReason": "Before ending:`,
+	} {
+		if !strings.Contains(output, expected) {
+			t.Fatalf("missing %q in Kimi Stop output: %s", expected, output)
+		}
+	}
+}
+
+func TestEncodeProviderResultUsesKimiStructuredDeny(t *testing.T) {
+	t.Parallel()
+
+	output := encodedProviderOutput(t, `{
+		"provider": "kimi",
+		"hook_event_name": "PreToolUse",
+		"tool_name": "Bash",
+		"tool_input": {"command": "git commit --no-verify -m test"}
+	}`)
+
+	for _, expected := range []string{
+		`"decision": "deny"`,
+		`"permissionDecision": "deny"`,
+		`"trackingID": "hook-`,
+	} {
+		if !strings.Contains(output, expected) {
+			t.Fatalf("missing %q in Kimi deny output: %s", expected, output)
+		}
+	}
+}
+
+func TestBlockedAdviceTOONIncludesAgentRemediation(t *testing.T) {
+	t.Setenv("CODE_ETHOS_HOOK_OUTPUT_FORMAT", "toon")
+
+	advice := BlockedAdvice(Result{
+		Event:      eventPreToolUse,
+		Tool:       toolBash,
+		Status:     statusBlocked,
+		TrackingID: "hook-test123",
+		Decisions: []policy.Decision{{
+			PolicyID:   "shell.github_admin",
+			Decision:   "block",
+			Severity:   "block",
+			Message:    "gh --admin bypasses normal review gates.",
+			Suggestion: "Use the normal review path.",
+		}},
+	})
+
+	for _, expected := range []string{
+		"trackingID: hook-test123",
+		"agent_remediation[1]{policy_id,skill_id,failed_action,next,mcp_tool}:",
+		"shell.github_admin,,Bash,Use the normal review path.,policy_explain",
+	} {
+		if !strings.Contains(advice, expected) {
+			t.Fatalf("missing %q in advice: %s", expected, advice)
+		}
+	}
+}
+
+func TestBlockedAdviceJSONIncludesAgentRemediation(t *testing.T) {
+	t.Setenv("CODE_ETHOS_HOOK_OUTPUT_FORMAT", "json")
+
+	advice := BlockedAdvice(severeViolationResult())
+
+	for _, expected := range []string{
+		`"agent_remediation":`,
+		`"tool": "policy_explain"`,
+	} {
+		if !strings.Contains(advice, expected) {
+			t.Fatalf("missing %q in advice: %s", expected, advice)
+		}
+	}
+}
+
+func encodedProviderOutput(t *testing.T, payload string) string {
+	t.Helper()
+
+	event, err := DecodeEvent(strings.NewReader(payload))
+	if err != nil {
+		t.Fatalf("decode event: %v", err)
+	}
+
+	result, err := Run(policy.ExampleBundle(), Options{Event: event})
+	if err != nil {
+		t.Fatalf("run hook: %v", err)
+	}
+
+	buffer := strings.Builder{}
+
+	inlineErr0 := EncodeResult(&buffer, result)
+	if inlineErr0 != nil {
+		t.Fatalf("encode result: %v", inlineErr0)
+	}
+
+	return buffer.String()
+}
+
+func assertJSONMatchesFixture(t *testing.T, output, fixturePath string) {
+	t.Helper()
+
+	var got any
+
+	inlineErr1 := json.Unmarshal([]byte(output), &got)
+	if inlineErr1 != nil {
+		t.Fatalf("decode provider output: %v\n%s", inlineErr1, output)
+	}
+
+	fixture, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatalf("read fixture %s: %v", fixturePath, err)
+	}
+
+	var want any
+
+	inlineErr2 := json.Unmarshal(fixture, &want)
+	if inlineErr2 != nil {
+		t.Fatalf("decode fixture %s: %v", fixturePath, inlineErr2)
+	}
+
+	assertJSONContains(t, got, want, fixturePath)
+}
+
+func assertJSONContains(t *testing.T, got, want any, path string) {
+	t.Helper()
+
+	switch expected := want.(type) {
+	case map[string]any:
+		actual, ok := got.(map[string]any)
+		if !ok {
+			t.Fatalf("%s: got %T, want object", path, got)
+		}
+
+		for key, value := range expected {
+			actualValue, ok := actual[key]
+			if !ok {
+				t.Fatalf("%s.%s missing in %#v", path, key, actual)
+			}
+
+			assertJSONContains(t, actualValue, value, path+"."+key)
+		}
+	case []any:
+		actual, ok := got.([]any)
+		if !ok {
+			t.Fatalf("%s: got %T, want array", path, got)
+		}
+
+		if len(actual) < len(expected) {
+			t.Fatalf("%s: got %d items, want at least %d", path, len(actual), len(expected))
+		}
+
+		for index, value := range expected {
+			assertJSONContains(t, actual[index], value, fmt.Sprintf("%s[%d]", path, index))
+		}
+	default:
+		if got != expected {
+			t.Fatalf("%s: got %#v, want %#v", path, got, expected)
+		}
+	}
+}

@@ -1,0 +1,433 @@
+# SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+style:
+  line_length: 100
+
+policy:
+  # Optional CEL-backed custom policies. Expressions are compiled and type
+  # checked into the policy bundle, then evaluated over normalized hook/lint
+  # input. CEL must stay pure: no file IO, shell, Git, network, time, or host
+  # environment access.
+  expressions:
+    - id: custom.no_python_subprocess_git
+      description: Block Python subprocess attempts to route around protected Git.
+      scope: command
+      severity: block
+      mode: block
+      protected: true
+      allow_override: false
+      allow_severity_weaken: false
+      hook_events: [PreToolUse]
+      tools: [Bash]
+      lint_scopes: [staged, files]
+      command_patterns: [subprocess]
+      principle_ids:
+        - one-path-for-critical-operations
+        - no-rationalized-shortcuts
+      skill_id: safe-git-workflow
+      when: >
+        shell_commands.exists(cmd,
+          cmd.name in ["python", "python3"] &&
+          cmd.argv.exists(arg, arg.contains("subprocess")) &&
+          cmd.argv.exists(arg, arg.contains("git"))
+        ) &&
+        paths.all(path, !path.is_generated)
+      message: Git must go through the coding-ethos wrapper.
+      advice: Use the protected Git wrapper and keep hook failures visible.
+
+repo:
+  # Optional consumer profile defaults. Explicit settings below still win.
+  # `go-static-site` enables Go checks and disables Python test/doc/type gates
+  # when no Python sources are present in the consumer repo.
+  kind: go-static-site
+  # Additional opt-in profiles can be layered when needed.
+  profiles:
+    - generated-site-output
+  license:
+    # Set this per consuming repo to opt into LICENSE file and header checks.
+    # When enabled, coding-ethos downloads the SPDX text, validates LICENSE
+    # without overwriting it, and requires matching source headers. The
+    # copyright string is also checked when configured.
+    # spdx_identifier: AGPL-3.0-only
+    # copyright: 2026 Example Inc.
+    # license_file: LICENSE
+
+hooks:
+  output_format: auto
+  success_output: silent
+  parallel_groups: true
+  tool_timeout_seconds: 600
+
+similarity:
+  enabled: true
+  structural_threshold: 0.8
+  min_symbol_lines: 5
+
+code_intel:
+  # Repo-local source indexing exclusions. Use these for generated or vendored
+  # paths that are specific to the consuming repository, such as static-site
+  # output directories.
+  exclude_paths:
+    - "**/dist/**"
+  health:
+    # Biomarkers are deterministic scoring inputs persisted into
+    # code_health_evidence. Reweight only to encode repo-specific facts, such as
+    # legacy code scheduled for deletion or generated files already excluded
+    # from direct editing.
+    biomarkers:
+      large_function:
+        enabled: true
+        weight: 1.0
+      complex_function:
+        enabled: true
+        weight: 1.0
+      structural_clone:
+        enabled: true
+        weight: 1.0
+    path_overrides:
+      - glob: "**/vendor/**"
+        disabled_biomarkers:
+          - large_file
+          - large_function
+          - complex_function
+          - structural_clone
+      - glob: "**/legacy/**"
+        weights:
+          large_function: 0.5
+          complex_function: 0.5
+          brain_method_candidate: 0.5
+
+proxy:
+  code_intel_enrichment:
+    # Compact PostToolUse hints for search/glob/read workflows. These hints are
+    # advisory and never block when the repo-local code-intel index is missing.
+    enabled: true
+    max_paths: 3
+    max_symbols: 6
+    max_edges: 4
+    max_failures: 4
+  context_advisor:
+    # Advisory context/token economy thresholds. These values only control when
+    # compact guidance appears in status, SessionStart, or code-intel
+    # context-advice output; they never block or enforce policy decisions.
+    enabled: true
+    warning_file_reads: 8
+    high_file_reads: 20
+    warning_file_listings: 3
+    high_file_listings: 8
+    warning_tool_calls: 10
+    high_tool_calls: 25
+    warning_truncations: 1
+    high_truncations: 3
+    warning_output_compression: 1
+    high_output_compression: 4
+    warning_spill_files: 1
+    high_spill_files: 5
+    warning_stale_surfaces: 1
+    high_stale_surfaces: 5
+    warning_total_tokens: 16000
+    high_total_tokens: 48000
+  output_compression:
+    # Repo-local defaults for Bash PostToolUse output returned to agents.
+    # The token ledger records every session-scoped Bash action in code-intel.
+    # If max_tokens is omitted, coding-ethos uses model/context-window tiers
+    # when the provider supplies them, otherwise it falls back to 2,000 tokens.
+    max_lines: 80
+    head_lines: 32
+    tail_lines: 32
+    max_tokens: 2000
+    head_tokens: 900
+    tail_tokens: 900
+    max_diagnostics: 12
+
+git:
+  staged_admin_files:
+    basenames:
+      - pyproject.toml
+      - repo_config.yaml
+    dirs:
+      - .github
+
+generated_config:
+  ci:
+    github_actions:
+      enabled: true
+      coding_ethos_path: coding-ethos
+      repo_root: .
+      gate_command: make check
+      sarif_path: coding-ethos.sarif
+      artifact_name: coding-ethos-audit
+      standalone_triggers: false
+      timeout_minutes: 30
+      sarif_category: policy
+    gitlab:
+      enabled: true
+      coding_ethos_path: coding-ethos
+      repo_root: .
+      gate_command: make check
+      sarif_path: coding-ethos.sarif
+      test_command: ""
+      build_command: ""
+      package_check_command: ""
+      dist_artifact_path: dist/
+      timeout_minutes: 30
+      artifact_expire_in: 7 days
+
+sandbox:
+  # Extra host paths that managed lint tools may read and write when
+  # sandboxing is enabled. Use this only for required workspace/toolchain
+  # directories; .git writes remain blocked even if listed here.
+  read_write_paths: []
+  # Managed tools remain no-network by default. List only tools whose test or
+  # validation workflow must bind local sockets or otherwise use networking.
+  network_tools:
+    - go-test
+
+filesystem:
+  protected_path:
+    enabled: true
+    paths:
+      - path/to/protected/generated-hook
+  protected_branch_write:
+    branches:
+      - main
+      - release
+    exempt_path_prefixes:
+      - .claude/
+      - docs/plans/
+  required_ignores:
+    enabled: true
+    paths:
+      - .claude/settings.local.json
+      - .coding-ethos/cache/
+      - .coding-ethos/code-intel.duckdb
+      - .coding-ethos/code-intel.duckdb.wal
+      - .coding-ethos/events/
+      - .coding-ethos/hook-runs/
+      - .coding-ethos/lint-runs/
+      - .coding-ethos/prune-runs/
+      - .coding-ethos/state/
+      - .gemini/settings.json
+      - .mcp.json
+  pii_scrubber:
+    enabled: true
+    patterns:
+      - '/(home|Users)/[A-Za-z0-9._-]+/'
+      - '/tmp/tmp\.[A-Za-z0-9._-]+'
+    literals: []
+    allowed_patterns:
+      - '/home/agent/'
+    exempt_prefixes:
+      - .git/
+
+shell:
+  dangerous_command:
+    enabled: true
+  background_git:
+    enabled: true
+  github_admin:
+    enabled: true
+
+python:
+  uv_exclude_newer:
+    enabled: true
+    expected_value: 7 days
+  source_paths:
+    - lib/python/project
+    - pre-commit/hooks
+  test_paths:
+    - lib/python/tests
+    - integration/tests
+  stub_paths:
+    - lib/python/stubs
+  extra_paths:
+    - lib/python
+    - scripts
+    - pre-commit/hooks
+  venv_path: ..
+  venv: .venv
+  comment_suppressions:
+    patterns:
+      - regex: '#\s*custom:\s*bypass\b'
+        label: custom bypass
+  module_docs:
+    source_docs_path: docs/SOURCE_DOCS.md
+    banned_doc_filenames:
+      - README.md
+  direct_imports:
+    packages:
+      - project
+
+  util_centralization:
+    enabled: true
+    banned_modules:
+      - module: requests
+        alternative: Use `project.http` instead.
+        exempt_paths:
+          - src/project/http.py
+
+  sql_centralization:
+    enabled: true
+    module_name: project.sql
+    central_paths:
+      - src/project/sql.py
+    min_string_length: 15
+
+  structured_logging:
+    logger_names:
+      - logger
+      - audit_log
+    exempt_kwargs:
+      - exc_info
+      - stack_info
+      - trace_id
+
+  conditional_imports:
+    capability_prefix: FEATURE_
+
+  type_checking_imports:
+    type_checking_names:
+      - TYPE_CHECKING
+
+  catch_and_silence:
+    enabled: true
+
+  optional_returns:
+    exempt_method_names:
+      - __exit__
+      - __aexit__
+      - maybe_cleanup
+
+  security_patterns:
+    secret_patterns:
+      - sk-
+      - hf_
+      - token_
+    test_file_markers:
+      - tests
+      - smoke_tests
+
+  plan_completion:
+    enabled: true
+    metadata_filename: metadata.yaml
+    root_markers:
+      - docs/plans/
+
+  pytest_gate:
+    enabled: true
+    test_command:
+      - uv
+      - run
+      - pytest
+      - lib/python/tests
+      - integration/tests
+      - --strict-markers
+
+  file_docstrings:
+    min_sentences: 4
+
+  type_check:
+    enabled: true
+    excluded_path_fragments:
+      - /docker/
+      - vulture_whitelist
+    checkers:
+      - name: ruff
+        enabled: true
+        command:
+          - ruff
+          - check
+          - --quiet
+          - --ignore-noqa
+          - --output-format
+          - json
+        pass_files_as_args: true
+        use_hook_project: true
+        config_flags:
+          - --config
+        repo_config: ruff.toml
+      - name: pyright
+        enabled: true
+        command:
+          - pyright
+          - --outputjson
+        pass_files_as_args: true
+        use_hook_project: true
+        config_flags:
+          - --project
+          - -p
+        repo_config: pyrightconfig.json
+      - name: mypy
+        enabled: true
+        command:
+          - mypy
+          - --output
+          - json
+        pass_files_as_args: true
+        use_hook_project: true
+        config_flags:
+          - --config-file
+        repo_config: mypy.ini
+      - name: pylint
+        enabled: false
+        command:
+          - pylint
+          - --output-format=json
+        pass_files_as_args: true
+        use_hook_project: true
+        config_flags:
+          - --rcfile
+        repo_config: .pylintrc
+
+  docstring_coverage:
+    enabled: true
+    check_paths:
+      - lib/python/project
+    ignore_private: false
+    ignore_nested_classes: false
+
+  version_consistency:
+    enabled: true
+
+tooling:
+  pyright:
+    include:
+      - lib/python/project
+      - pre-commit/hooks
+  pylint:
+    disable:
+      - missing-module-docstring
+      - missing-class-docstring
+      - missing-function-docstring
+      - line-too-long
+      - too-few-public-methods
+      - duplicate-code
+  golangci_lint:
+    linters:
+      enable:
+        - ginkgolinter
+      exclusions:
+        rules:
+          - path: internal/generated/
+            linters:
+              - lll
+              - misspell
+
+gemini:
+  model: gemini-2.5-flash
+  model_overrides:
+    code_ethos: gemini-2.5-pro
+  service_tier: standard
+  service_tier_overrides:
+    shell_review: flex
+  cache:
+    enabled: true
+    ttl_seconds: 86400
+    api_enabled: true
+    api_ttl_seconds: 1800
+  modal_allowlist_files:
+    - scripts/bootstrap.sh
+
+go:
+  worktree: go

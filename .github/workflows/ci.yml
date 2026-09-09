@@ -1,0 +1,779 @@
+# SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: CI
+
+on:
+  pull_request:
+  merge_group:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    name: Validate GitHub workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          enable-cache: true
+
+      - name: Build shared Go tools
+        run: make go-tools-install
+
+      - name: Install coding-ethos sandbox AppArmor profile
+        run: |
+          set -euo pipefail
+          profile=/etc/apparmor.d/coding-ethos-sandbox
+          run_path="${GITHUB_WORKSPACE}/bin/coding-ethos-run"
+          sandbox_path="${GITHUB_WORKSPACE}/bin/coding-ethos-sandbox"
+          toolchain_path="${GITHUB_WORKSPACE}/bin/coding-ethos-toolchain"
+          sudo tee "$profile" >/dev/null <<EOF
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          "$run_path" flags=(unconfined) {
+            userns,
+            capability sys_admin,
+            mount,
+            remount,
+          }
+
+          "$sandbox_path" flags=(unconfined) {
+            userns,
+            capability sys_admin,
+            mount,
+            remount,
+          }
+
+          "$toolchain_path" flags=(unconfined) {
+            userns,
+            capability sys_admin,
+            mount,
+            remount,
+          }
+
+          # Parent-runtime e2e tests copy these binaries into temp repos and
+          # execute them from .git/coding-ethos-hooks/bin; without a matching
+          # attachment the copies run confined and sandbox mounts get EPERM.
+          "/tmp/**/coding-ethos-hooks/bin/*" flags=(unconfined) {
+            userns,
+            capability sys_admin,
+            mount,
+            remount,
+          }
+          EOF
+          sudo apparmor_parser -r "$profile"
+
+      - name: Delegate Linux cgroup v2 controllers
+        run: |
+          set -euo pipefail
+          cgroup_relative="$(
+            awk -F: '$1 == "0" { print $3; exit }' /proc/self/cgroup
+          )"
+          cgroup_path="/sys/fs/cgroup${cgroup_relative}"
+          if [ "$cgroup_relative" = "/" ] || [ ! -f "$cgroup_path/cgroup.procs" ]; then
+            echo "::error::cgroup v2 delegation target is unavailable: $cgroup_path"
+            exit 1
+          fi
+
+          sudo chown -R "$(id -u):$(id -g)" "$cgroup_path"
+          verify_cgroup="$cgroup_path/coding-ethos-ci-verify-$$"
+          mkdir "$verify_cgroup"
+          cleanup() { rmdir "$verify_cgroup" 2>/dev/null || true; }
+          trap cleanup EXIT
+
+          sleep 60 &
+          verify_pid="$!"
+          if ! printf '%s\n' "$verify_pid" > "$verify_cgroup/cgroup.procs"; then
+            kill "$verify_pid" 2>/dev/null || true
+            wait "$verify_pid" 2>/dev/null || true
+            echo "::error::unable to assign a process to delegated cgroup"
+            exit 1
+          fi
+          kill "$verify_pid" 2>/dev/null || true
+          wait "$verify_pid" 2>/dev/null || true
+
+      - name: Validate sandbox runtime preflight
+        run: |
+          set +e
+          bin/coding-ethos-toolchain validate-sandbox-runtime
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::group::AppArmor status"
+            sudo aa-status || true
+            echo "::endgroup::"
+            echo "::group::Loaded sandbox profiles"
+            sudo grep -E 'coding-ethos-(run|sandbox|toolchain)|unprivileged' \
+              /sys/kernel/security/apparmor/profiles || true
+            echo "::endgroup::"
+            echo "::group::Recent AppArmor denials"
+            sudo dmesg | tail -n 200 | grep -i apparmor || true
+            echo "::endgroup::"
+            exit "$status"
+          fi
+
+      - name: Build managed toolchain
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: make build
+
+      - name: Run actionlint through coding-ethos
+        run: >-
+          bin/coding-ethos-run policy-tool actionlint
+          .github/workflows/*.yml
+
+  policy:
+    name: Coding Ethos SARIF Gate
+    uses: ./.github/workflows/coding-ethos-sarif.yml
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+  lint:
+    name: Unified lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          enable-cache: true
+
+      - name: Build shared Go tools
+        run: make go-tools-install
+
+      - name: Install coding-ethos sandbox AppArmor profile
+        run: |
+          set -euo pipefail
+          profile=/etc/apparmor.d/coding-ethos-sandbox
+          run_path="${GITHUB_WORKSPACE}/bin/coding-ethos-run"
+          sandbox_path="${GITHUB_WORKSPACE}/bin/coding-ethos-sandbox"
+          toolchain_path="${GITHUB_WORKSPACE}/bin/coding-ethos-toolchain"
+          sudo tee "$profile" >/dev/null <<EOF
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          "$run_path" flags=(unconfined) {
+            userns,
+            capability sys_admin,
+            mount,
+            remount,
+          }
+
+          "$sandbox_path" flags=(unconfined) {
+            userns,
+            capability sys_admin,
+            mount,
+            remount,
+          }
+
+          "$toolchain_path" flags=(unconfined) {
+            userns,
+            capability sys_admin,
+            mount,
+            remount,
+          }
+
+          # Parent-runtime e2e tests copy these binaries into temp repos and
+          # execute them from .git/coding-ethos-hooks/bin; without a matching
+          # attachment the copies run confined and sandbox mounts get EPERM.
+          "/tmp/**/coding-ethos-hooks/bin/*" flags=(unconfined) {
+            userns,
+            capability sys_admin,
+            mount,
+            remount,
+          }
+          EOF
+          sudo apparmor_parser -r "$profile"
+
+      - name: Delegate Linux cgroup v2 controllers
+        run: |
+          set -euo pipefail
+          cgroup_relative="$(
+            awk -F: '$1 == "0" { print $3; exit }' /proc/self/cgroup
+          )"
+          cgroup_path="/sys/fs/cgroup${cgroup_relative}"
+          if [ "$cgroup_relative" = "/" ] || [ ! -f "$cgroup_path/cgroup.procs" ]; then
+            echo "::error::cgroup v2 delegation target is unavailable: $cgroup_path"
+            exit 1
+          fi
+
+          sudo chown -R "$(id -u):$(id -g)" "$cgroup_path"
+          verify_cgroup="$cgroup_path/coding-ethos-ci-verify-$$"
+          mkdir "$verify_cgroup"
+          cleanup() { rmdir "$verify_cgroup" 2>/dev/null || true; }
+          trap cleanup EXIT
+
+          sleep 60 &
+          verify_pid="$!"
+          if ! printf '%s\n' "$verify_pid" > "$verify_cgroup/cgroup.procs"; then
+            kill "$verify_pid" 2>/dev/null || true
+            wait "$verify_pid" 2>/dev/null || true
+            echo "::error::unable to assign a process to delegated cgroup"
+            exit 1
+          fi
+          kill "$verify_pid" 2>/dev/null || true
+          wait "$verify_pid" 2>/dev/null || true
+
+      - name: Validate sandbox runtime preflight
+        run: |
+          set +e
+          bin/coding-ethos-toolchain validate-sandbox-runtime
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::group::AppArmor status"
+            sudo aa-status || true
+            echo "::endgroup::"
+            echo "::group::Loaded sandbox profiles"
+            sudo grep -E 'coding-ethos-(run|sandbox|toolchain)|unprivileged' \
+              /sys/kernel/security/apparmor/profiles || true
+            echo "::endgroup::"
+            echo "::group::Recent AppArmor denials"
+            sudo dmesg | tail -n 200 | grep -i apparmor || true
+            echo "::endgroup::"
+            exit "$status"
+          fi
+
+      - name: Build managed toolchain
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: make build
+
+      - name: Run unified lint
+        run: make lint
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.11"
+          - "3.13"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          enable-cache: true
+
+      - name: Build shared Go tools
+        run: make go-tools-install
+
+      - name: Install coding-ethos sandbox AppArmor profile
+        run: |
+          set -euo pipefail
+          profile=/etc/apparmor.d/coding-ethos-sandbox
+          run_path="${GITHUB_WORKSPACE}/bin/coding-ethos-run"
+          sandbox_path="${GITHUB_WORKSPACE}/bin/coding-ethos-sandbox"
+          toolchain_path="${GITHUB_WORKSPACE}/bin/coding-ethos-toolchain"
+          sudo tee "$profile" >/dev/null <<EOF
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          "$run_path" flags=(unconfined) {
+            userns,
+            capability sys_admin,
+            mount,
+            remount,
+          }
+
+          "$sandbox_path" flags=(unconfined) {
+            userns,
+            capability sys_admin,
+            mount,
+            remount,
+          }
+
+          "$toolchain_path" flags=(unconfined) {
+            userns,
+            capability sys_admin,
+            mount,
+            remount,
+          }
+
+          # Parent-runtime e2e tests copy these binaries into temp repos and
+          # execute them from .git/coding-ethos-hooks/bin; without a matching
+          # attachment the copies run confined and sandbox mounts get EPERM.
+          "/tmp/**/coding-ethos-hooks/bin/*" flags=(unconfined) {
+            userns,
+            capability sys_admin,
+            mount,
+            remount,
+          }
+          EOF
+          sudo apparmor_parser -r "$profile"
+
+      - name: Delegate Linux cgroup v2 controllers
+        run: |
+          set -euo pipefail
+          cgroup_relative="$(
+            awk -F: '$1 == "0" { print $3; exit }' /proc/self/cgroup
+          )"
+          cgroup_path="/sys/fs/cgroup${cgroup_relative}"
+          if [ "$cgroup_relative" = "/" ] || [ ! -f "$cgroup_path/cgroup.procs" ]; then
+            echo "::error::cgroup v2 delegation target is unavailable: $cgroup_path"
+            exit 1
+          fi
+
+          sudo chown -R "$(id -u):$(id -g)" "$cgroup_path"
+          verify_cgroup="$cgroup_path/coding-ethos-ci-verify-$$"
+          mkdir "$verify_cgroup"
+          cleanup() { rmdir "$verify_cgroup" 2>/dev/null || true; }
+          trap cleanup EXIT
+
+          sleep 60 &
+          verify_pid="$!"
+          if ! printf '%s\n' "$verify_pid" > "$verify_cgroup/cgroup.procs"; then
+            kill "$verify_pid" 2>/dev/null || true
+            wait "$verify_pid" 2>/dev/null || true
+            echo "::error::unable to assign a process to delegated cgroup"
+            exit 1
+          fi
+          kill "$verify_pid" 2>/dev/null || true
+          wait "$verify_pid" 2>/dev/null || true
+
+      - name: Validate sandbox runtime preflight
+        run: |
+          set +e
+          bin/coding-ethos-toolchain validate-sandbox-runtime
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::group::AppArmor status"
+            sudo aa-status || true
+            echo "::endgroup::"
+            echo "::group::Loaded sandbox profiles"
+            sudo grep -E 'coding-ethos-(run|sandbox|toolchain)|unprivileged' \
+              /sys/kernel/security/apparmor/profiles || true
+            echo "::endgroup::"
+            echo "::group::Recent AppArmor denials"
+            sudo dmesg | tail -n 200 | grep -i apparmor || true
+            echo "::endgroup::"
+            exit "$status"
+          fi
+
+      - name: Sync dependencies
+        run: uv sync --frozen --group dev --all-packages
+
+      - name: Build managed runtime
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: make build
+
+      - name: Run test suite with coverage
+        env:
+          COVERAGE_XML: test-results/coverage-python-${{ matrix.python-version }}.xml
+          COVERAGE_TXT: test-results/coverage-python-${{ matrix.python-version }}.txt
+          PYTEST_XML: test-results/pytest-${{ matrix.python-version }}.xml
+        run: |
+          mkdir -p test-results
+          uv run coverage run \
+            --source=coding_ethos \
+            -m pytest \
+            --junitxml="$PYTEST_XML"
+          uv run coverage xml -o "$COVERAGE_XML"
+          uv run coverage report --fail-under=80 > "$COVERAGE_TXT"
+
+      - name: Summarize test results
+        if: ${{ always() && hashFiles('test-results/*.xml') != '' }}
+        run: |
+          python - <<'PY'
+          import pathlib
+          import xml.etree.ElementTree as ET
+
+          rows = []
+          for path in sorted(pathlib.Path("test-results").glob("*.xml")):
+              root = ET.parse(path).getroot()
+              rows.append((
+                  path.name,
+                  root.attrib.get("tests", "0"),
+                  root.attrib.get("failures", "0"),
+                  root.attrib.get("errors", "0"),
+                  root.attrib.get("skipped", "0"),
+              ))
+
+          with open("${GITHUB_STEP_SUMMARY}", "a", encoding="utf-8") as summary:
+              summary.write("## Pytest results\\n\\n")
+              summary.write("| report | tests | failures | errors | skipped |\\n")
+              summary.write("| --- | ---: | ---: | ---: | ---: |\\n")
+              for row in rows:
+                  summary.write("| {} | {} | {} | {} | {} |\\n".format(*row))
+              summary.write("\\n### Python coverage\\n\\n```text\\n")
+              for path in sorted(
+                  pathlib.Path("test-results").glob("coverage-python-*.txt")
+              ):
+                  summary.write(path.read_text(encoding="utf-8"))
+              summary.write("```\\n")
+          PY
+
+      - name: Upload pytest results
+        if: ${{ always() && hashFiles('test-results/*.xml') != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pytest-results-${{ matrix.python-version }}
+          path: test-results/*.xml
+          if-no-files-found: error
+
+      - name: Upload Python coverage report
+        if: ${{ always() && hashFiles('test-results/coverage-python-*') != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: python-coverage-${{ matrix.python-version }}
+          path: test-results/coverage-python-*
+          if-no-files-found: error
+
+  go-coverage:
+    name: Go coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version-file: go/go.mod
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          enable-cache: true
+
+      - name: Build shared Go tools
+        run: make go-tools-install
+
+      - name: Install coding-ethos sandbox AppArmor profile
+        run: |
+          set -euo pipefail
+          profile=/etc/apparmor.d/coding-ethos-sandbox
+          run_path="${GITHUB_WORKSPACE}/bin/coding-ethos-run"
+          sandbox_path="${GITHUB_WORKSPACE}/bin/coding-ethos-sandbox"
+          toolchain_path="${GITHUB_WORKSPACE}/bin/coding-ethos-toolchain"
+          sudo tee "$profile" >/dev/null <<EOF
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          "$run_path" flags=(unconfined) {
+            userns,
+            capability sys_admin,
+            mount,
+            remount,
+          }
+
+          "$sandbox_path" flags=(unconfined) {
+            userns,
+            capability sys_admin,
+            mount,
+            remount,
+          }
+
+          "$toolchain_path" flags=(unconfined) {
+            userns,
+            capability sys_admin,
+            mount,
+            remount,
+          }
+
+          # Parent-runtime e2e tests copy these binaries into temp repos and
+          # execute them from .git/coding-ethos-hooks/bin; without a matching
+          # attachment the copies run confined and sandbox mounts get EPERM.
+          "/tmp/**/coding-ethos-hooks/bin/*" flags=(unconfined) {
+            userns,
+            capability sys_admin,
+            mount,
+            remount,
+          }
+          EOF
+          sudo apparmor_parser -r "$profile"
+
+      - name: Delegate Linux cgroup v2 controllers
+        run: |
+          set -euo pipefail
+          cgroup_relative="$(
+            awk -F: '$1 == "0" { print $3; exit }' /proc/self/cgroup
+          )"
+          cgroup_path="/sys/fs/cgroup${cgroup_relative}"
+          if [ "$cgroup_relative" = "/" ] || [ ! -f "$cgroup_path/cgroup.procs" ]; then
+            echo "::error::cgroup v2 delegation target is unavailable: $cgroup_path"
+            exit 1
+          fi
+
+          sudo chown -R "$(id -u):$(id -g)" "$cgroup_path"
+          verify_cgroup="$cgroup_path/coding-ethos-ci-verify-$$"
+          mkdir "$verify_cgroup"
+          cleanup() { rmdir "$verify_cgroup" 2>/dev/null || true; }
+          trap cleanup EXIT
+
+          sleep 60 &
+          verify_pid="$!"
+          if ! printf '%s\n' "$verify_pid" > "$verify_cgroup/cgroup.procs"; then
+            kill "$verify_pid" 2>/dev/null || true
+            wait "$verify_pid" 2>/dev/null || true
+            echo "::error::unable to assign a process to delegated cgroup"
+            exit 1
+          fi
+          kill "$verify_pid" 2>/dev/null || true
+          wait "$verify_pid" 2>/dev/null || true
+
+      - name: Validate sandbox runtime preflight
+        run: |
+          set +e
+          bin/coding-ethos-toolchain validate-sandbox-runtime
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::group::AppArmor status"
+            sudo aa-status || true
+            echo "::endgroup::"
+            echo "::group::Loaded sandbox profiles"
+            sudo grep -E 'coding-ethos-(run|sandbox|toolchain)|unprivileged' \
+              /sys/kernel/security/apparmor/profiles || true
+            echo "::endgroup::"
+            echo "::group::Recent AppArmor denials"
+            sudo dmesg | tail -n 200 | grep -i apparmor || true
+            echo "::endgroup::"
+            exit "$status"
+          fi
+
+      - name: Build coding-ethos runtime
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: make build
+
+      - name: Run shared Go coverage
+        run: |
+          mkdir -p ../coverage-results
+          mapfile -t shared_packages < <(
+            go list -buildvcs=false ./... | grep -v '/internal/e2e$'
+          )
+          go test -buildvcs=false -timeout=90s -short "${shared_packages[@]}" \
+            -covermode=atomic \
+            -coverprofile=../coverage-results/go-shared.out
+          go test -buildvcs=false -timeout=90s ./internal/e2e
+          go tool cover \
+            -func=../coverage-results/go-shared.out \
+            > ../coverage-results/go-shared.txt
+          awk '
+            /^total:/ {
+              gsub("%", "", $3);
+              if ($3 + 0 < 80.0) {
+                printf "shared Go coverage %.1f%% is below 80.0%%\n", $3;
+                exit 1;
+              }
+            }
+          ' \
+            ../coverage-results/go-shared.txt
+        working-directory: go
+
+      - name: Run hook runtime Go coverage
+        run: |
+          go run ./cmd/coding-ethos-policy compile \
+            --primary ../coding_ethos.yml \
+            --config ../config.yaml \
+            --out-dir ../build/policy
+          go test -buildvcs=false -timeout=90s \
+            ./internal/hookrunnercli \
+            ./internal/hooks \
+            -covermode=atomic \
+            -coverprofile=../coverage-results/go-hooks.out
+          go tool cover \
+            -func=../coverage-results/go-hooks.out \
+            > ../coverage-results/go-hooks.txt
+          awk '
+            /^total:/ {
+              gsub("%", "", $3);
+              if ($3 + 0 < 80.0) {
+                printf "hook Go coverage %.1f%% is below 80.0%%\n", $3;
+                exit 1;
+              }
+            }
+          ' \
+            ../coverage-results/go-hooks.txt
+        working-directory: go
+
+      - name: Summarize Go coverage
+        if: ${{ always() && hashFiles('coverage-results/go-*.txt') != '' }}
+        run: |
+          {
+            echo "## Go coverage"
+            echo
+            echo '```text'
+            cat coverage-results/go-*.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Go coverage reports
+        if: ${{ always() && hashFiles('coverage-results/*') != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: go-coverage
+          path: coverage-results/*
+          if-no-files-found: error
+
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          enable-cache: true
+
+      - name: Build package
+        run: uv build
+
+      - name: Validate package metadata
+        run: uvx twine check dist/*.tar.gz dist/*.whl
+
+      - name: Generate distribution checksums
+        run: |
+          mkdir -p dist-checksums
+          sha256sum dist/*.tar.gz dist/*.whl > dist-checksums/SHA256SUMS
+
+      - name: Prepare SBOM output directory
+        run: mkdir -p sbom
+
+      - name: Generate distribution SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
+        with:
+          path: .
+          output-file: sbom/coding-ethos.spdx.json
+          format: spdx-json
+          upload-artifact: false
+
+      - name: Attest distribution artifacts
+        # SLSA provenance binds each built distribution to this repository,
+        # workflow identity, commit, and build event through GitHub OIDC.
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.whl
+
+      - name: Attest distribution checksums
+        # The checksum file is a release-facing trust artifact, so it receives
+        # its own provenance instead of being treated as incidental output.
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
+        with:
+          subject-path: dist-checksums/SHA256SUMS
+
+      - name: Attest distribution SBOM
+        # SBOM mode binds the SPDX document to the distribution subjects listed
+        # in SHA256SUMS. Do not replace this with the deprecated attest-sbom
+        # wrapper.
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
+        with:
+          subject-checksums: dist-checksums/SHA256SUMS
+          sbom-path: sbom/coding-ethos.spdx.json
+
+      - name: Upload distribution artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Upload distribution checksums
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: dist-checksums
+          path: dist-checksums/SHA256SUMS
+          if-no-files-found: error
+
+      - name: Upload distribution SBOM
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: dist-sbom
+          path: sbom/coding-ethos.spdx.json
+          if-no-files-found: error

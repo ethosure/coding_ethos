@@ -1,0 +1,60 @@
+// SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package evaluators
+
+import (
+	"github.com/ethosure/coding_ethos/go/diagnostics"
+	"github.com/ethosure/coding_ethos/go/internal/celexpr"
+)
+
+type Context struct {
+	Diagnostic         *diagnostics.Diagnostic
+	EvaluatorOptions   map[string]any
+	EventName          string
+	OldContent         string
+	CurrentBranch      string
+	Cwd                string
+	TranscriptPath     string
+	EventMatcher       string
+	EventSource        string
+	Provider           string
+	Scope              string
+	SessionID          string
+	StrategicIntent    string
+	ActiveTodo         string
+	Tool               string
+	Content            string
+	Command            string
+	ToolResponseKeys   []string
+	ToolInputKeys      []string
+	Findings           []Finding
+	HookCommands       []celexpr.HookCommandInput
+	SimilarityFacts    []celexpr.SimilarityFactInput
+	Diagnostics        []diagnostics.Diagnostic
+	Files              []string
+	ChangedFiles       []string
+	StagedFiles        []string
+	Argv               []string
+	Stdin              []byte
+	Proxy              celexpr.ProxyInput
+	ReturnCode         int
+	HasToolResponse    bool
+	AdminApproved      bool
+	ReadOnlyInspection bool
+	HasToolInput       bool
+	HasReturnCode      bool
+}
+
+type Finding struct {
+	Tool         string
+	Code         string
+	Message      string
+	File         string
+	Severity     string
+	PolicyID     string
+	SkillID      string
+	PrincipleIDs []string
+	Column       int
+	Line         int
+}

@@ -1,0 +1,692 @@
+// SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package celexpr
+
+import (
+	"bytes"
+	"os"
+	"path"
+	"slices"
+	"strings"
+
+	"github.com/ethosure/coding_ethos/go/internal/astfacts"
+)
+
+type ProposedFileChangeInput struct {
+	Base                      string `json:"base"`
+	Dir                       string `json:"dir"`
+	Ext                       string `json:"ext"`
+	File                      string `json:"file"`
+	CurrentLineCount          int64  `json:"current_line_count"`
+	ProposedLineCount         int64  `json:"proposed_line_count"`
+	LineDelta                 int64  `json:"line_delta"`
+	CurrentNonBlankLineCount  int64  `json:"current_nonblank_line_count"`
+	ProposedNonBlankLineCount int64  `json:"proposed_nonblank_line_count"`
+	NonBlankLineDelta         int64  `json:"nonblank_line_delta"`
+	CurrentSizeBytes          int64  `json:"current_size_bytes"`
+	ProposedSizeBytes         int64  `json:"proposed_size_bytes"`
+	SizeDelta                 int64  `json:"size_delta"`
+	Exists                    bool   `json:"exists"`
+	HasProposedContent        bool   `json:"has_proposed_content"`
+	IsBinary                  bool   `json:"is_binary"`
+	IsGenerated               bool   `json:"is_generated"`
+	IsTest                    bool   `json:"is_test"`
+	LineCountGrows            bool   `json:"line_count_grows"`
+	LineCountShrinks          bool   `json:"line_count_shrinks"`
+	NonBlankLineCountGrows    bool   `json:"nonblank_line_count_grows"`
+	NonBlankLineCountShrinks  bool   `json:"nonblank_line_count_shrinks"`
+	SizeGrows                 bool   `json:"size_grows"`
+	SizeShrinks               bool   `json:"size_shrinks"`
+	ReplacementMatched        bool   `json:"replacement_matched"`
+	ReplacementAmbiguous      bool   `json:"replacement_ambiguous"`
+}
+
+type ProposedSymbolChangeInput struct {
+	Base                      string `json:"base"`
+	CurrentContentHash        string `json:"current_content_hash"`
+	Dir                       string `json:"dir"`
+	Ext                       string `json:"ext"`
+	File                      string `json:"file"`
+	Language                  string `json:"language"`
+	NodeKind                  string `json:"node_kind"`
+	ProposedContentHash       string `json:"proposed_content_hash"`
+	SymbolKind                string `json:"symbol_kind"`
+	SymbolName                string `json:"symbol_name"`
+	SymbolPath                string `json:"symbol_path"`
+	Action                    string `json:"action"`
+	CurrentEndLine            int64  `json:"current_end_line"`
+	CurrentLineCount          int64  `json:"current_line_count"`
+	CurrentNonBlankLineCount  int64  `json:"current_nonblank_line_count"`
+	CurrentStartLine          int64  `json:"current_start_line"`
+	LineDelta                 int64  `json:"line_delta"`
+	NonBlankLineDelta         int64  `json:"nonblank_line_delta"`
+	ProposedEndLine           int64  `json:"proposed_end_line"`
+	ProposedLineCount         int64  `json:"proposed_line_count"`
+	ProposedNonBlankLineCount int64  `json:"proposed_nonblank_line_count"`
+	ProposedStartLine         int64  `json:"proposed_start_line"`
+	IsGenerated               bool   `json:"is_generated"`
+	IsTest                    bool   `json:"is_test"`
+	LineCountGrows            bool   `json:"line_count_grows"`
+	LineCountShrinks          bool   `json:"line_count_shrinks"`
+	NonBlankLineCountGrows    bool   `json:"nonblank_line_count_grows"`
+	NonBlankLineCountShrinks  bool   `json:"nonblank_line_count_shrinks"`
+}
+
+func proposedFileChangeInputs(input ActivationInput) []ProposedFileChangeInput {
+	if changes := proposedApplyPatchChangeInputs(input); len(changes) > 0 {
+		return changes
+	}
+
+	files := cleanStringSlice(input.Files)
+	if len(files) == 0 {
+		return nil
+	}
+
+	changes := make([]ProposedFileChangeInput, 0, len(files))
+	for _, file := range files {
+		change, found := proposedFileChangeInput(input, file)
+		if found {
+			changes = append(changes, change)
+		}
+	}
+
+	return changes
+}
+
+type applyPatchFileDelta struct {
+	file              string
+	lineDelta         int
+	nonBlankLineDelta int
+	sizeDelta         int
+	deleteFile        bool
+}
+
+func proposedApplyPatchChangeInputs(input ActivationInput) []ProposedFileChangeInput {
+	deltas := parseApplyPatchDeltas(input.Command)
+	if len(deltas) == 0 {
+		return nil
+	}
+
+	changes := make([]ProposedFileChangeInput, 0, len(deltas))
+	for _, delta := range deltas {
+		change, found := proposedApplyPatchChangeInput(input.Cwd, delta)
+		if found {
+			changes = append(changes, change)
+		}
+	}
+
+	return changes
+}
+
+func parseApplyPatchDeltas(command string) []applyPatchFileDelta {
+	if !strings.Contains(command, "*** Begin Patch") {
+		return nil
+	}
+
+	state := applyPatchState{}
+
+	for rawLine := range strings.SplitSeq(command, "\n") {
+		nextState, started := startApplyPatchFileDelta(state, rawLine)
+		if started {
+			state = nextState
+
+			continue
+		}
+
+		state = updateApplyPatchState(state, rawLine)
+	}
+
+	if state.inFile {
+		state.deltas = append(state.deltas, state.current)
+	}
+
+	out := make([]applyPatchFileDelta, 0, len(state.deltas))
+	for _, delta := range state.deltas {
+		if cleanInputFile(delta.file) != "" {
+			out = append(out, delta)
+		}
+	}
+
+	return out
+}
+
+type applyPatchState struct {
+	deltas  []applyPatchFileDelta
+	current applyPatchFileDelta
+	inFile  bool
+}
+
+func startApplyPatchFileDelta(
+	state applyPatchState,
+	rawLine string,
+) (applyPatchState, bool) {
+	for _, marker := range applyPatchFileMarkers() {
+		if !strings.HasPrefix(rawLine, marker.Prefix) {
+			continue
+		}
+
+		if state.inFile {
+			state.deltas = append(state.deltas, state.current)
+		}
+
+		state.current = applyPatchFileDelta{
+			file:       strings.TrimSpace(strings.TrimPrefix(rawLine, marker.Prefix)),
+			deleteFile: marker.DeleteFile,
+		}
+		state.inFile = true
+
+		return state, true
+	}
+
+	return state, false
+}
+
+func updateApplyPatchState(state applyPatchState, rawLine string) applyPatchState {
+	switch {
+	case strings.HasPrefix(rawLine, "*** Move to: ") && state.inFile:
+		state.current.file = strings.TrimSpace(
+			strings.TrimPrefix(rawLine, "*** Move to: "),
+		)
+	case !state.inFile:
+	case strings.HasPrefix(rawLine, "***"):
+	case strings.HasPrefix(rawLine, "@@"):
+	case strings.HasPrefix(rawLine, "+"):
+		state.current = updateApplyPatchLineDelta(state.current, rawLine, 1)
+	case strings.HasPrefix(rawLine, "-"):
+		state.current = updateApplyPatchLineDelta(state.current, rawLine, -1)
+	}
+
+	return state
+}
+
+type applyPatchFileMarker struct {
+	Prefix     string
+	DeleteFile bool
+}
+
+func applyPatchFileMarkers() []applyPatchFileMarker {
+	return []applyPatchFileMarker{
+		{Prefix: "*** Add File: "},
+		{Prefix: "*** Update File: "},
+		{Prefix: "*** Delete File: ", DeleteFile: true},
+	}
+}
+
+func updateApplyPatchLineDelta(
+	current applyPatchFileDelta,
+	rawLine string,
+	direction int,
+) applyPatchFileDelta {
+	text := rawLine[1:]
+	current.lineDelta += direction
+
+	current.sizeDelta += direction * (len([]byte(text)) + 1)
+	if !isBlankLine(text) {
+		current.nonBlankLineDelta += direction
+	}
+
+	return current
+}
+
+func proposedApplyPatchChangeInput(
+	cwd string,
+	delta applyPatchFileDelta,
+) (ProposedFileChangeInput, bool) {
+	cleanFile := cleanInputFile(delta.file)
+	if cleanFile == "" {
+		return ProposedFileChangeInput{}, false
+	}
+
+	currentContent, exists, binary := readTextFile(cwd, cleanFile)
+	if binary {
+		return ProposedFileChangeInput{
+			Base:     path.Base(cleanFile),
+			Dir:      path.Dir(cleanFile),
+			Ext:      strings.ToLower(path.Ext(cleanFile)),
+			File:     cleanFile,
+			Exists:   exists,
+			IsBinary: true,
+		}, true
+	}
+
+	currentLines := countLines(currentContent)
+	currentNonBlankLines := countNonBlankLines(currentContent)
+	currentSize := int64(len([]byte(currentContent)))
+	proposedLines := currentLines + delta.lineDelta
+	proposedNonBlankLines := currentNonBlankLines + delta.nonBlankLineDelta
+
+	proposedSize := currentSize + int64(delta.sizeDelta)
+	if delta.deleteFile {
+		proposedLines = 0
+		proposedNonBlankLines = 0
+		proposedSize = 0
+	}
+
+	if proposedLines < 0 {
+		proposedLines = 0
+	}
+
+	if proposedNonBlankLines < 0 {
+		proposedNonBlankLines = 0
+	}
+
+	if proposedSize < 0 {
+		proposedSize = 0
+	}
+
+	return ProposedFileChangeInput{
+		Base:                      path.Base(cleanFile),
+		Dir:                       path.Dir(cleanFile),
+		Ext:                       strings.ToLower(path.Ext(cleanFile)),
+		File:                      cleanFile,
+		CurrentLineCount:          int64(currentLines),
+		ProposedLineCount:         int64(proposedLines),
+		LineDelta:                 int64(proposedLines - currentLines),
+		CurrentNonBlankLineCount:  int64(currentNonBlankLines),
+		ProposedNonBlankLineCount: int64(proposedNonBlankLines),
+		NonBlankLineDelta:         int64(proposedNonBlankLines - currentNonBlankLines),
+		CurrentSizeBytes:          currentSize,
+		ProposedSizeBytes:         proposedSize,
+		SizeDelta:                 proposedSize - currentSize,
+		Exists:                    exists,
+		HasProposedContent:        false,
+		IsGenerated:               isGeneratedPath(cleanFile),
+		IsTest:                    isTestPath(cleanFile),
+		LineCountGrows:            proposedLines > currentLines,
+		LineCountShrinks:          proposedLines < currentLines,
+		NonBlankLineCountGrows:    proposedNonBlankLines > currentNonBlankLines,
+		NonBlankLineCountShrinks:  proposedNonBlankLines < currentNonBlankLines,
+		SizeGrows:                 proposedSize > currentSize,
+		SizeShrinks:               proposedSize < currentSize,
+		ReplacementMatched:        true,
+	}, true
+}
+
+func proposedSymbolChangeInputs(input ActivationInput) []ProposedSymbolChangeInput {
+	files := cleanStringSlice(input.Files)
+	if len(files) == 0 {
+		return nil
+	}
+
+	changes := []ProposedSymbolChangeInput{}
+
+	for _, file := range files {
+		change, found := proposedFileChangeInput(input, file)
+		if !found || !change.HasProposedContent || change.IsBinary {
+			continue
+		}
+
+		currentContent, _, binary := readTextFile(input.Cwd, change.File)
+		if binary {
+			continue
+		}
+
+		proposedContent, _, _, found := proposedContentForTool(
+			input.Tool,
+			currentContent,
+			input.OldContent,
+			input.Content,
+			change.Exists,
+		)
+		if !found {
+			continue
+		}
+
+		changes = append(
+			changes,
+			symbolChangesForContent(change.File, currentContent, proposedContent)...)
+	}
+
+	return changes
+}
+
+func symbolChangesForContent(
+	file string,
+	currentContent string,
+	proposedContent string,
+) []ProposedSymbolChangeInput {
+	currentFile, currentOK, currentErr := astfacts.Analyze(file, []byte(currentContent))
+
+	proposedFile, proposedOK, proposedErr := astfacts.Analyze(
+		file,
+		[]byte(proposedContent),
+	)
+
+	if currentErr != nil || proposedErr != nil || !currentOK || !proposedOK {
+		return nil
+	}
+
+	current := symbolsByKey(currentFile.Symbols)
+	proposed := symbolsByKey(proposedFile.Symbols)
+
+	// Track deletions and additions for rename matching
+	deletions := make(map[string]astfacts.Symbol)
+	additions := make(map[string]astfacts.Symbol)
+	changes := []ProposedSymbolChangeInput{}
+
+	// First pass: identify direct matches (unchanged/modified) and separate others
+	for key, currentSymbol := range current {
+		if proposedSymbol, found := proposed[key]; found {
+			change := proposedSymbolChange(file, currentSymbol, true, proposedSymbol, true)
+			if change.Action != changeActionUnchanged {
+				changes = append(changes, change)
+			}
+		} else {
+			deletions[key] = currentSymbol
+		}
+	}
+
+	for key, proposedSymbol := range proposed {
+		if _, found := current[key]; !found {
+			additions[key] = proposedSymbol
+		}
+	}
+
+	// Second pass: match renames
+	changes = append(changes, matchSymbolRenames(file, deletions, additions)...)
+
+	// Third pass: add remaining deletions and additions
+	for _, s := range deletions {
+		changes = append(
+			changes,
+			proposedSymbolChange(file, s, true, astfacts.Symbol{}, false),
+		)
+	}
+
+	for _, s := range additions {
+		changes = append(
+			changes,
+			proposedSymbolChange(file, astfacts.Symbol{}, false, s, true),
+		)
+	}
+
+	// Sort changes by SymbolPath for deterministic output
+	slices.SortFunc(changes, func(a, b ProposedSymbolChangeInput) int {
+		return strings.Compare(a.SymbolPath, b.SymbolPath)
+	})
+
+	return changes
+}
+
+func matchSymbolRenames(
+	file string,
+	deletions map[string]astfacts.Symbol,
+	additions map[string]astfacts.Symbol,
+) []ProposedSymbolChangeInput {
+	changes := []ProposedSymbolChangeInput{}
+
+	// Group by (NodeKind, SymbolKind, ParentSymbolPath)
+	type groupKey struct {
+		NodeKind   string
+		SymbolKind string
+		Parent     string
+	}
+
+	deletedGroups := make(map[groupKey][]string)
+
+	for key, s := range deletions {
+		gk := groupKey{s.NodeKind, s.SymbolKind, parentSymbolPath(s.SymbolPath)}
+		deletedGroups[gk] = append(deletedGroups[gk], key)
+	}
+
+	addedGroups := make(map[groupKey][]string)
+
+	for key, s := range additions {
+		gk := groupKey{s.NodeKind, s.SymbolKind, parentSymbolPath(s.SymbolPath)}
+		addedGroups[gk] = append(addedGroups[gk], key)
+	}
+
+	for gk, dKeys := range deletedGroups {
+		aKeys, found := addedGroups[gk]
+
+		if found && len(dKeys) == 1 && len(aKeys) == 1 {
+			// Found a 1-to-1 match for a potential rename in the same scope
+			d := deletions[dKeys[0]]
+			a := additions[aKeys[0]]
+
+			change := proposedSymbolChange(file, d, true, a, true)
+			change.Action = changeActionRenamed
+			changes = append(changes, change)
+
+			delete(deletions, dKeys[0])
+			delete(additions, aKeys[0])
+		}
+	}
+
+	return changes
+}
+
+func symbolsByKey(symbols []astfacts.Symbol) map[string]astfacts.Symbol {
+	result := map[string]astfacts.Symbol{}
+	for _, symbol := range symbols {
+		result[symbolKey(symbol)] = symbol
+	}
+
+	return result
+}
+
+func sortedSymbolKeys(left, right map[string]astfacts.Symbol) []string {
+	keys := make([]string, 0, len(left)+len(right))
+	for key := range left {
+		keys = append(keys, key)
+	}
+
+	for key := range right {
+		if _, found := left[key]; !found {
+			keys = append(keys, key)
+		}
+	}
+
+	slices.Sort(keys)
+
+	return keys
+}
+
+func symbolKey(symbol astfacts.Symbol) string {
+	return strings.Join([]string{
+		symbol.Language,
+		symbol.NodeKind,
+		symbol.SymbolKind,
+		symbol.SymbolPath,
+	}, "\x00")
+}
+
+func parentSymbolPath(symbolPath string) string {
+	index := strings.LastIndex(symbolPath, ".")
+	if index == -1 {
+		return ""
+	}
+
+	return symbolPath[:index]
+}
+
+func proposedSymbolChange(
+	file string,
+	current astfacts.Symbol,
+	hasCurrent bool,
+	proposed astfacts.Symbol,
+	hasProposed bool,
+) ProposedSymbolChangeInput {
+	symbol := proposed
+	if !hasProposed {
+		symbol = current
+	}
+
+	currentLines := 0
+	proposedLines := 0
+	currentNonBlankLines := 0
+	proposedNonBlankLines := 0
+
+	if hasCurrent {
+		currentLines = current.LineCount
+		currentNonBlankLines = countNonBlankLines(current.RawText)
+	}
+
+	if hasProposed {
+		proposedLines = proposed.LineCount
+		proposedNonBlankLines = countNonBlankLines(proposed.RawText)
+	}
+
+	action := changeActionUnchanged
+
+	switch {
+	case !hasCurrent && hasProposed:
+		action = changeActionAdded
+	case hasCurrent && !hasProposed:
+		action = changeActionDeleted
+	case current.ContentHash != proposed.ContentHash:
+		action = changeActionModified
+	}
+
+	return ProposedSymbolChangeInput{
+		Base:                      path.Base(file),
+		CurrentContentHash:        current.ContentHash,
+		Dir:                       path.Dir(file),
+		Ext:                       strings.ToLower(path.Ext(file)),
+		File:                      file,
+		Language:                  symbol.Language,
+		NodeKind:                  symbol.NodeKind,
+		ProposedContentHash:       proposed.ContentHash,
+		SymbolKind:                symbol.SymbolKind,
+		SymbolName:                symbol.SymbolName,
+		SymbolPath:                symbol.SymbolPath,
+		Action:                    action,
+		CurrentEndLine:            int64(current.EndLine),
+		CurrentLineCount:          int64(currentLines),
+		CurrentNonBlankLineCount:  int64(currentNonBlankLines),
+		CurrentStartLine:          int64(current.StartLine),
+		LineDelta:                 int64(proposedLines - currentLines),
+		NonBlankLineDelta:         int64(proposedNonBlankLines - currentNonBlankLines),
+		ProposedEndLine:           int64(proposed.EndLine),
+		ProposedLineCount:         int64(proposedLines),
+		ProposedNonBlankLineCount: int64(proposedNonBlankLines),
+		ProposedStartLine:         int64(proposed.StartLine),
+		IsGenerated:               isGeneratedPath(file),
+		IsTest:                    isTestPath(file),
+		LineCountGrows:            proposedLines > currentLines,
+		LineCountShrinks:          proposedLines < currentLines,
+		NonBlankLineCountGrows:    proposedNonBlankLines > currentNonBlankLines,
+		NonBlankLineCountShrinks:  proposedNonBlankLines < currentNonBlankLines,
+	}
+}
+
+func proposedFileChangeInput(
+	input ActivationInput,
+	file string,
+) (ProposedFileChangeInput, bool) {
+	cleanFile := cleanInputFile(file)
+	if cleanFile == "" {
+		return ProposedFileChangeInput{}, false
+	}
+
+	currentContent, exists, binary := readTextFile(input.Cwd, cleanFile)
+	if binary {
+		return ProposedFileChangeInput{
+			Base:     path.Base(cleanFile),
+			Dir:      path.Dir(cleanFile),
+			Ext:      strings.ToLower(path.Ext(cleanFile)),
+			File:     cleanFile,
+			Exists:   exists,
+			IsBinary: true,
+		}, true
+	}
+
+	proposedContent, matched, ambiguous, found := proposedContentForTool(
+		input.Tool,
+		currentContent,
+		input.OldContent,
+		input.Content,
+		exists,
+	)
+	if !found {
+		return ProposedFileChangeInput{}, false
+	}
+
+	currentLines := countLines(currentContent)
+	proposedLines := countLines(proposedContent)
+	currentNonBlankLines := countNonBlankLines(currentContent)
+	proposedNonBlankLines := countNonBlankLines(proposedContent)
+	currentSize := int64(len([]byte(currentContent)))
+	proposedSize := int64(len([]byte(proposedContent)))
+
+	return ProposedFileChangeInput{
+		Base:                      path.Base(cleanFile),
+		Dir:                       path.Dir(cleanFile),
+		Ext:                       strings.ToLower(path.Ext(cleanFile)),
+		File:                      cleanFile,
+		CurrentLineCount:          int64(currentLines),
+		ProposedLineCount:         int64(proposedLines),
+		LineDelta:                 int64(proposedLines - currentLines),
+		CurrentNonBlankLineCount:  int64(currentNonBlankLines),
+		ProposedNonBlankLineCount: int64(proposedNonBlankLines),
+		NonBlankLineDelta:         int64(proposedNonBlankLines - currentNonBlankLines),
+		CurrentSizeBytes:          currentSize,
+		ProposedSizeBytes:         proposedSize,
+		SizeDelta:                 proposedSize - currentSize,
+		Exists:                    exists,
+		HasProposedContent:        true,
+		IsGenerated:               isGeneratedPath(cleanFile),
+		IsTest:                    isTestPath(cleanFile),
+		LineCountGrows:            proposedLines > currentLines,
+		LineCountShrinks:          proposedLines < currentLines,
+		NonBlankLineCountGrows:    proposedNonBlankLines > currentNonBlankLines,
+		NonBlankLineCountShrinks:  proposedNonBlankLines < currentNonBlankLines,
+		SizeGrows:                 proposedSize > currentSize,
+		SizeShrinks:               proposedSize < currentSize,
+		ReplacementMatched:        matched,
+		ReplacementAmbiguous:      ambiguous,
+	}, true
+}
+
+func proposedContentForTool(
+	tool string,
+	currentContent string,
+	oldContent string,
+	newContent string,
+	exists bool,
+) (string, bool, bool, bool) {
+	switch tool {
+	case "Write":
+		return newContent, exists, false, true
+	case "Edit", "MultiEdit":
+		if oldContent == "" {
+			return "", false, false, false
+		}
+
+		count := strings.Count(currentContent, oldContent)
+		if count == 0 {
+			return currentContent, false, false, true
+		}
+
+		if count > 1 {
+			return strings.ReplaceAll(
+				currentContent,
+				oldContent,
+				newContent,
+			), true, true, true
+		}
+
+		return strings.Replace(
+			currentContent,
+			oldContent,
+			newContent,
+			1,
+		), true, false, true
+	default:
+		return "", false, false, false
+	}
+}
+
+func readTextFile(cwd, file string) (string, bool, bool) {
+	content, err := os.ReadFile(resolveFilePath(cwd, file))
+	if err != nil {
+		return "", false, false
+	}
+
+	if bytes.Contains(content, []byte{0}) {
+		return "", true, true
+	}
+
+	return string(content), true, false
+}

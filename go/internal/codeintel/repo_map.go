@@ -1,0 +1,597 @@
+// SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+// SPDX-License-Identifier: AGPL-3.0-only
+
+package codeintel
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"math"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+)
+
+const (
+	defaultRepoMapLimit          = 20
+	defaultRepoMapSymbolsPerFile = 4
+	repoMapSymbolQueryArgs       = 4
+	repoMapSymbolWeight          = 10
+	repoMapChunkWeight           = 2
+	repoMapLineDivisor           = 50
+	repoMapLineWeightLimit       = 20
+	repoMapSignatureMaxRunes     = 96
+	repoMapCandidateLimitFactor  = 5
+)
+
+const globalRepoMapFilesSQL = `SELECT file.path, file.language, file.line_count,
+	COUNT(chunk.chunk_id) AS chunks,
+	SUM(CASE WHEN COALESCE(chunk.symbol_path, '') != '' THEN 1 ELSE 0 END) AS symbols,
+	COALESCE(git.hotspot_score, 0) AS hotspot_score,
+	COALESCE(git.primary_author_email, '') AS primary_author_email,
+	COALESCE(hidden.hidden_coupling_count, 0) AS hidden_coupling_count
+FROM code_files file
+LEFT JOIN code_chunks chunk ON chunk.path = file.path
+LEFT JOIN git_file_signals git ON git.path = file.path
+LEFT JOIN (
+	SELECT path, COUNT(*) AS hidden_coupling_count
+	FROM git_cochanges
+	WHERE hidden_coupling != 0
+	GROUP BY path
+) hidden ON hidden.path = file.path
+WHERE (? = '' OR file.path = ? OR file.path LIKE ? ESCAPE '\')
+	AND (? = '' OR file.language = ?)
+	AND COALESCE(file.deleted_at_utc, '') = ''
+	AND COALESCE(file.stale_reason, '') = ''
+GROUP BY file.path, file.language, file.line_count, git.hotspot_score,
+	git.primary_author_email, hidden.hidden_coupling_count
+ORDER BY hotspot_score DESC, symbols DESC, chunks DESC,
+	file.line_count DESC, file.path
+LIMIT ?`
+
+// GlobalRepoMap returns a compact repository-level AST map for startup and MCP
+// context. It ranks files by indexed symbol density and then includes the first
+// high-signal symbols from each selected file.
+func (store *Store) GlobalRepoMap(
+	ctx context.Context,
+	query RepoMapQuery,
+) (RepoMap, error) {
+	return globalRepoMap(ctx, query, store)
+}
+
+func (store *DuckDBStore) GlobalRepoMap(
+	ctx context.Context,
+	query RepoMapQuery,
+) (RepoMap, error) {
+	return globalRepoMap(ctx, query, store)
+}
+
+type globalRepoMapStore interface {
+	repoMapFiles(ctx context.Context, query RepoMapQuery) ([]RepoMapFile, error)
+	codeCommunityIDsByPath(
+		ctx context.Context,
+		query CodeCommunityQuery,
+		files []RepoMapFile,
+	) (map[string]string, error)
+	repoMapSymbols(
+		ctx context.Context,
+		query RepoMapQuery,
+		files []RepoMapFile,
+	) ([]RepoMapSymbol, error)
+	validateASTContextPathsFresh(
+		ctx context.Context,
+		root string,
+		paths []string,
+	) error
+}
+
+func globalRepoMap(
+	ctx context.Context,
+	query RepoMapQuery,
+	store globalRepoMapStore,
+) (RepoMap, error) {
+	files, err := store.repoMapFiles(ctx, query)
+	if err != nil {
+		return RepoMap{}, err
+	}
+
+	if len(files) == 0 {
+		return RepoMap{Root: strings.TrimSpace(query.Root)}, nil
+	}
+
+	err = store.validateASTContextPathsFresh(ctx, query.Root, repoMapFilePaths(files))
+	if err != nil {
+		return RepoMap{}, err
+	}
+
+	symbols, err := store.repoMapSymbols(ctx, query, files)
+	if err != nil {
+		return RepoMap{}, err
+	}
+
+	communitiesByPath, err := store.codeCommunityIDsByPath(ctx, CodeCommunityQuery{
+		Root:  query.Root,
+		Path:  query.Path,
+		Limit: repoMapLimit(query),
+	}, files)
+	if err != nil {
+		return RepoMap{}, err
+	}
+
+	symbolsByFile := map[string][]RepoMapSymbol{}
+	for _, symbol := range symbols {
+		if len(symbolsByFile[symbol.Path]) >= repoMapSymbolsPerFile(query) {
+			continue
+		}
+
+		symbol.ProvenanceClasses = []string{ProvenanceExtracted}
+		symbolsByFile[symbol.Path] = append(symbolsByFile[symbol.Path], symbol)
+	}
+
+	for index := range files {
+		files[index].Symbols = symbolsByFile[files[index].Path]
+		files[index].CommunityID = communitiesByPath[files[index].Path]
+	}
+
+	return RepoMap{
+		Root:  strings.TrimSpace(query.Root),
+		Files: files,
+	}, nil
+}
+
+func (store *DuckDBStore) repoMapFiles(
+	ctx context.Context,
+	query RepoMapQuery,
+) ([]RepoMapFile, error) {
+	return queryRepoMapFiles(ctx, store.database, query, "DuckDB global")
+}
+
+func (store *DuckDBStore) repoMapSymbols(
+	ctx context.Context,
+	query RepoMapQuery,
+	files []RepoMapFile,
+) ([]RepoMapSymbol, error) {
+	if len(files) == 0 {
+		return nil, nil
+	}
+
+	placeholders, args := repoMapSymbolQueryArgsForFiles(query, files)
+
+	// #nosec G202 -- placeholders are generated from file count; values remain bound.
+	rows, err := store.database.QueryContext(
+		ctx,
+		`SELECT path, language, kind, name, symbol_path, start_line, end_line, raw_text
+		FROM (
+			SELECT code_chunks.path,
+				code_chunks.language,
+				COALESCE(symbol_kind, '') AS kind,
+				COALESCE(symbol_name, '') AS name,
+				COALESCE(symbol_path, '') AS symbol_path,
+				start_line,
+				end_line,
+				raw_text,
+				ROW_NUMBER() OVER (
+					PARTITION BY code_chunks.path
+					ORDER BY start_line, start_byte
+				) AS symbol_rank
+			FROM code_chunks
+			JOIN code_files ON code_files.path = code_chunks.path
+			WHERE COALESCE(symbol_path, '') != ''
+				AND COALESCE(code_files.deleted_at_utc, '') = ''
+				AND COALESCE(code_files.stale_reason, '') = ''
+				AND code_chunks.path IN (`+strings.Join(placeholders, ",")+`)
+				AND (? = '' OR code_chunks.language = ?)
+		)
+		WHERE symbol_rank <= ?
+		ORDER BY path, start_line, symbol_path
+		LIMIT ?`,
+		args...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query DuckDB global repo map symbols: %w", err)
+	}
+	defer rows.Close()
+
+	return scanRepoMapSymbols(rows, "DuckDB global")
+}
+
+func (store *Store) repoMapFiles(
+	ctx context.Context,
+	query RepoMapQuery,
+) ([]RepoMapFile, error) {
+	return queryRepoMapFiles(ctx, store.database, query, "global")
+}
+
+func queryRepoMapFiles(
+	ctx context.Context,
+	database *sql.DB,
+	query RepoMapQuery,
+	label string,
+) ([]RepoMapFile, error) {
+	ignoreMatcher := newGitIgnoreMatcher(ctx, strings.TrimSpace(query.Root))
+	pathFilter := repoMapPathFilter(query.Path)
+
+	rows, err := database.QueryContext(
+		ctx,
+		globalRepoMapFilesSQL,
+		pathFilter.Exact,
+		pathFilter.Exact,
+		pathFilter.PrefixLike,
+		strings.TrimSpace(query.Language),
+		strings.TrimSpace(query.Language),
+		repoMapCandidateLimit(query),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query %s repo map files: %w", label, err)
+	}
+	defer rows.Close()
+
+	files := []RepoMapFile{}
+
+	for rows.Next() {
+		var file RepoMapFile
+
+		err = rows.Scan(
+			&file.Path,
+			&file.Language,
+			&file.LineCount,
+			&file.ChunkCount,
+			&file.SymbolCount,
+			&file.HotspotScore,
+			&file.PrimaryAuthorEmail,
+			&file.HiddenCouplingCount,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan %s repo map file: %w", label, err)
+		}
+
+		if repoMapPathExcluded(ctx, ignoreMatcher, file.Path) {
+			continue
+		}
+
+		file.Score = repoMapFileScore(file)
+		file.ProvenanceClasses = repoMapFileProvenanceClasses(file)
+		files = append(files, file)
+
+		if len(files) >= repoMapLimit(query) {
+			break
+		}
+	}
+
+	err = rows.Err()
+	if err != nil {
+		return nil, fmt.Errorf("iterate %s repo map files: %w", label, err)
+	}
+
+	return files, nil
+}
+
+type repoMapPathQueryFilter struct {
+	Exact      string
+	PrefixLike string
+}
+
+func repoMapFileProvenanceClasses(file RepoMapFile) []string {
+	classes := []string{ProvenanceExtracted}
+	if file.HotspotScore > 0 ||
+		file.HiddenCouplingCount > 0 ||
+		strings.TrimSpace(file.PrimaryAuthorEmail) != "" {
+		classes = append(classes, ProvenanceGitDerived)
+	}
+
+	return classes
+}
+
+func repoMapPathFilter(path string) repoMapPathQueryFilter {
+	cleanPath := strings.Trim(
+		filepath.ToSlash(filepath.Clean(strings.TrimSpace(path))),
+		"/",
+	)
+	if cleanPath == "." {
+		cleanPath = ""
+	}
+
+	return repoMapPathQueryFilter{
+		Exact:      cleanPath,
+		PrefixLike: escapeSQLLikePattern(cleanPath) + "/%",
+	}
+}
+
+func escapeSQLLikePattern(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `%`, `\%`)
+	value = strings.ReplaceAll(value, `_`, `\_`)
+
+	return value
+}
+
+func repoMapPathExcluded(
+	ctx context.Context,
+	ignoreMatcher gitIgnoreMatcher,
+	path string,
+) bool {
+	cleanPath := filepath.ToSlash(filepath.Clean(path))
+	if cleanPath == "." {
+		return false
+	}
+
+	if slices.Contains(repoMapExcludedExactPaths(), cleanPath) {
+		return true
+	}
+
+	for _, prefix := range repoMapExcludedPrefixes() {
+		if strings.HasPrefix(cleanPath, prefix) {
+			return true
+		}
+	}
+
+	if ignoreMatcher.root == "" {
+		return false
+	}
+
+	return ignoreMatcher.ignoredFile(ctx, filepath.Join(ignoreMatcher.root, cleanPath))
+}
+
+func (store *Store) repoMapSymbols(
+	ctx context.Context,
+	query RepoMapQuery,
+	files []RepoMapFile,
+) ([]RepoMapSymbol, error) {
+	if len(files) == 0 {
+		return nil, nil
+	}
+
+	placeholders, args := repoMapSymbolQueryArgsForFiles(query, files)
+
+	// #nosec G202 -- IN-list placeholders are generated from selected file rows.
+	rows, err := store.database.QueryContext(
+		ctx,
+		`SELECT path, language, kind, name, symbol_path, start_line, end_line, raw_text
+		FROM (
+			SELECT code_chunks.path,
+				code_chunks.language,
+				COALESCE(symbol_kind, '') AS kind,
+				COALESCE(symbol_name, '') AS name,
+				COALESCE(symbol_path, '') AS symbol_path,
+				start_line,
+				end_line,
+				raw_text,
+				ROW_NUMBER() OVER (
+					PARTITION BY code_chunks.path
+					ORDER BY start_line, start_byte
+				) AS symbol_rank
+			FROM code_chunks
+			JOIN code_files ON code_files.path = code_chunks.path
+			WHERE COALESCE(symbol_path, '') != ''
+				AND COALESCE(code_files.deleted_at_utc, '') = ''
+				AND COALESCE(code_files.stale_reason, '') = ''
+				AND code_chunks.path IN (`+strings.Join(placeholders, ",")+`)
+				AND (? = '' OR code_chunks.language = ?)
+		)
+		WHERE symbol_rank <= ?
+		ORDER BY path, start_line, symbol_path
+		LIMIT ?`,
+		args...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query global repo map symbols: %w", err)
+	}
+	defer rows.Close()
+
+	return scanRepoMapSymbols(rows, "global")
+}
+
+func scanRepoMapSymbols(rows *sql.Rows, label string) ([]RepoMapSymbol, error) {
+	symbols := []RepoMapSymbol{}
+
+	for rows.Next() {
+		var (
+			symbol  RepoMapSymbol
+			rawText string
+		)
+
+		err := rows.Scan(
+			&symbol.Path,
+			&symbol.Language,
+			&symbol.Kind,
+			&symbol.Name,
+			&symbol.SymbolPath,
+			&symbol.StartLine,
+			&symbol.EndLine,
+			&rawText,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan %s repo map symbol: %w", label, err)
+		}
+
+		symbol.Signature = repoMapSignature(rawText)
+		symbols = append(symbols, symbol)
+	}
+
+	err := rows.Err()
+	if err != nil {
+		return nil, fmt.Errorf("iterate %s repo map symbols: %w", label, err)
+	}
+
+	return symbols, nil
+}
+
+func repoMapSymbolQueryArgsForFiles(
+	query RepoMapQuery,
+	files []RepoMapFile,
+) ([]string, []any) {
+	placeholders := make([]string, len(files))
+	args := make([]any, 0, len(files)+repoMapSymbolQueryArgs)
+
+	for index, file := range files {
+		placeholders[index] = "?"
+
+		args = append(args, file.Path)
+	}
+
+	symbolLimit := repoMapSymbolsPerFile(query)
+
+	args = append(
+		args,
+		strings.TrimSpace(query.Language),
+		strings.TrimSpace(query.Language),
+		symbolLimit,
+		len(files)*symbolLimit,
+	)
+
+	return placeholders, args
+}
+
+func repoMapFilePaths(files []RepoMapFile) []string {
+	paths := make([]string, 0, len(files))
+	for _, file := range files {
+		paths = append(paths, file.Path)
+	}
+
+	return paths
+}
+
+func repoMapLimit(query RepoMapQuery) int {
+	if query.Limit > 0 {
+		return query.Limit
+	}
+
+	return defaultRepoMapLimit
+}
+
+func repoMapCandidateLimit(query RepoMapQuery) int {
+	return repoMapLimit(query) * repoMapCandidateLimitFactor
+}
+
+func repoMapExcludedExactPaths() []string {
+	return []string{
+		".bandit.yml",
+		".github/workflows/coding-ethos-sarif.yml",
+		".gitlab-ci.yml",
+		".golangci.yml",
+		".pylintrc",
+		".sqlfluff",
+		".yamllint.yml",
+		"mypy.ini",
+		"pyrightconfig.json",
+		"ruff.toml",
+		"tombi.toml",
+	}
+}
+
+func repoMapExcludedPrefixes() []string {
+	return []string{
+		".agent-context/",
+		".agents/",
+		".claude/",
+		".coding-ethos/",
+		".codex/",
+		".gemini/",
+		".venv/",
+		"coding-ethos/",
+		"coding-ethos-hooks/",
+	}
+}
+
+func repoMapSymbolsPerFile(query RepoMapQuery) int {
+	if query.SymbolsPerFile > 0 {
+		return query.SymbolsPerFile
+	}
+
+	return defaultRepoMapSymbolsPerFile
+}
+
+func repoMapFileScore(file RepoMapFile) int {
+	lineWeight := int(math.Min(
+		float64(file.LineCount/repoMapLineDivisor),
+		repoMapLineWeightLimit,
+	))
+
+	return file.SymbolCount*repoMapSymbolWeight +
+		file.ChunkCount*repoMapChunkWeight +
+		lineWeight +
+		int(math.Round(file.HotspotScore)) +
+		file.HiddenCouplingCount*repoMapChunkWeight
+}
+
+func repoMapSignature(rawText string) string {
+	for line := range strings.Lines(rawText) {
+		signature := strings.TrimSpace(line)
+		if signature == "" {
+			continue
+		}
+
+		signature = strings.ReplaceAll(signature, ";", " ")
+
+		return truncateRepoMapSignature(signature)
+	}
+
+	return ""
+}
+
+func truncateRepoMapSignature(value string) string {
+	runes := []rune(value)
+	if len(runes) <= repoMapSignatureMaxRunes {
+		return value
+	}
+
+	return string(runes[:repoMapSignatureMaxRunes]) + "..."
+}
+
+// RenderRepoMapTOON renders the repository map as compact startup/MCP context.
+func RenderRepoMapTOON(repoMap RepoMap) string {
+	if len(repoMap.Files) == 0 {
+		return ""
+	}
+
+	lines := []string{
+		"coding_ethos_repo_map:",
+		"root: " + quoteAnatomyValue(repoMap.Root),
+		"files[" + strconv.Itoa(len(repoMap.Files)) +
+			"]{path,language,lines,score,hotspot,hidden_couplings," +
+			"owner,community,provenance,symbols}:",
+	}
+
+	for _, file := range repoMap.Files {
+		lines = append(lines, strings.Join([]string{
+			"  " + quoteAnatomyValue(file.Path),
+			quoteAnatomyValue(file.Language),
+			strconv.Itoa(file.LineCount),
+			strconv.Itoa(file.Score),
+			strconv.FormatFloat(file.HotspotScore, 'f', 1, 64),
+			strconv.Itoa(file.HiddenCouplingCount),
+			quoteAnatomyValue(file.PrimaryAuthorEmail),
+			quoteAnatomyValue(file.CommunityID),
+			quoteAnatomyValue(strings.Join(file.ProvenanceClasses, "|")),
+			quoteAnatomyValue(renderRepoMapSymbols(file.Symbols)),
+		}, ","))
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func renderRepoMapSymbols(symbols []RepoMapSymbol) string {
+	parts := make([]string, 0, len(symbols))
+
+	for _, symbol := range symbols {
+		name := firstNonEmpty(symbol.SymbolPath, symbol.Name)
+		if name == "" {
+			continue
+		}
+
+		part := name
+		if symbol.StartLine > 0 {
+			part += "@" + strconv.Itoa(symbol.StartLine)
+		}
+
+		if symbol.Signature != "" {
+			part += "=" + symbol.Signature
+		}
+
+		parts = append(parts, part)
+	}
+
+	return strings.Join(parts, ";")
+}

@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: 2026 Ethosure Governance Inc. <oss@ethosure.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+"""Python fixture overwritten by e2e tests to create a real Ruff finding.
+
+This checked-in file stays lint-clean. The e2e suite writes a temporary unused
+import into its sandbox copy so the repository does not ship known lint
+violations while still exercising real Ruff diagnostics.
+"""
+
+
+def answer() -> int:
+    """Return a stable value."""
+    return 42
