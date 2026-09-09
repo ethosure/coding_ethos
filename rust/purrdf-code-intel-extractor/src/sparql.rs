@@ -108,8 +108,8 @@ impl<'a> Walker<'a> {
                 version,
             } => {
                 self.emit_simple("sparql_document", "construct")?;
-                for triple in template {
-                    self.emit_triple_pattern("sparql_construct_template", triple)?;
+                for quad in template {
+                    self.emit_triple_pattern("sparql_construct_template", &quad.triple)?;
                 }
                 self.walk_dataset(dataset)?;
                 self.walk_pattern(pattern)?;
@@ -270,6 +270,31 @@ impl<'a> Walker<'a> {
                     None,
                     None,
                     BTreeMap::new(),
+                )?;
+                self.walk_expression(expression)?;
+                self.walk_pattern(inner)?;
+            }
+            GraphPattern::Unfold {
+                inner,
+                expression,
+                element,
+                companion,
+            } => {
+                self.emit(
+                    "sparql_binding",
+                    Some(SemanticTerm::Variable {
+                        value: element.as_str().to_owned(),
+                    }),
+                    None,
+                    companion.as_ref().map(|variable| SemanticTerm::Variable {
+                        value: variable.as_str().to_owned(),
+                    }),
+                    None,
+                    None,
+                    string_attributes(&[(
+                        "unfold_arity",
+                        if companion.is_some() { "2" } else { "1" }.to_owned(),
+                    )]),
                 )?;
                 self.walk_expression(expression)?;
                 self.walk_pattern(inner)?;
@@ -770,6 +795,7 @@ fn graph_pattern_kind(pattern: &GraphPattern) -> &'static str {
         GraphPattern::Union { .. } => "union",
         GraphPattern::Graph { .. } => "graph",
         GraphPattern::Extend { .. } => "extend",
+        GraphPattern::Unfold { .. } => "unfold",
         GraphPattern::Minus { .. } => "minus",
         GraphPattern::Service { .. } => "service",
         GraphPattern::Values { .. } => "values",

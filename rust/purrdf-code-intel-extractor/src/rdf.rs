@@ -22,13 +22,14 @@ pub fn extract(file: &FileRequest, language: &str) -> Result<FileResult, String>
     let options = ParseOptions {
         track_source_spans: true,
     };
-    let (dataset, spans) = parse_dataset_with(
+    let outcome = parse_dataset_with(
         file.content.as_bytes(),
         media_type,
         file.base_iri.as_deref(),
         &options,
     )
     .map_err(|error| format!("PurRDF {language} parse failed: {error}"))?;
+    let (dataset, spans) = (outcome.dataset, outcome.spans);
 
     let attributes = || {
         BTreeMap::from([
